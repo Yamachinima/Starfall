@@ -1,0 +1,117 @@
+--@name Modular Headlights
+--@author Yamachinima
+--@shared
+
+-- [CONFIGURATION INTERFACE] -------------------------------------------------
+local Cfg = {
+    -- [HARDWARE SETUP]
+    Offset_Right   = 35,   -- Distance from center to right headlight
+    Offset_Forward = 10,   -- Distance forward from chip
+    Offset_Up      = 0,    -- Height offset
+    Rotate_Pitch   = -90,  -- Base pitch angle
+    Rotate_Yaw     = 90,   -- Base yaw angle
+    Rotate_Roll    = 0,    -- Base roll angle
+
+    -- [LIGHTING TECHNOLOGY]
+    Light_Tech     = "SIMPLE", -- "MODERN" (Xenon/LED), "CLASSIC" (Halogen), "SIMPLE"
+    
+    -- [COLOR PALETTES] (RGB Vectors)
+    Classic = { Color_Dim = Vector(255,140,40), Color_Run = Vector(255,240,220) },
+    Modern  = { Color_Ignition = Vector(0,100,255), Color_Run = Vector(255,255,255), High_Beam_Lift = -3 },
+    Simple  = { Color_White = Vector(255,255,255) },
+
+    -- [TIMING & ANIMATION]
+    Beam_Smoothing   = 0.6,  -- 0.1 (Slow) to 1.0 (Instant)
+    Cold_Timeout     = 300,  -- Seconds to wait before resetting "Cold Start"
+    Warm_Fade_Speed  = 50,   -- Normal fade speed
+    Flash_Fade_Speed = 150,  -- High Beam Flash speed (Snappy)
+
+    -- [SYSTEM OPTIMIZATION]
+    Sleep_Timeout    = 300,  -- Seconds to track position after OFF before sleeping
+    LOD_Distance     = 4000, -- Max render distance
+
+    -- [VISUAL INTENSITY]
+    Sprite_Boost     = 5.0,  -- Flare Intensity (Higher = More Glow, Less Fog)
+    
+    -- [SPRITE SIZES] (Independent Tuning)
+    Sprite_Size_Low  = 0.3,  -- Size of the flare in Low Beam
+    Sprite_Size_High = 0.4,  -- Size of the flare in High Beam
+    
+    -- [INTERNAL MAPS] (Do not edit unless you know what you are doing)
+    Bright_Targets   = { [0]=0.0, [1]=4.0, [2]=8.0 },
+    Brightness_Mults = { [0]=0.0, [1]=0.14, [2]=0.18 }, -- Output intensity
+
+    -- [PROJECTED LIGHTS]
+    Texture    = "effects/flashlight/soft",
+    Shadows    = false, -- Keep false for server performance
+    NearZ      = 10,
+    FarZ       = 2000,
+    FOV_Low    = 90,
+    FOV_High   = 110,
+
+    -- [CONTROLS]
+    Use_Toggle = true, -- True = Switch, False = Button cycle
+    LED_Model  = "models/fasteroid/led_mini.mdl"
+}
+
+--================================================================================
+--MODULAR HEADLIGHTS SYSTEM
+--SYSTEM MANUAL & USER GUIDE
+--================================================================================
+--[II. INSTALLATION GUIDE]
+----------------------------------------------------------------------------------
+--1. SPAWNING:
+--  - Spawn a Starfall Processor on your vehicle chassis.
+--   - Paste the code (Version 6.1) into the chip.
+--2. WIRING INPUTS (Controls):
+--   - [Toggle]: Connect this to a Latching Switch or Toggle Button.
+--    (This controls your main On/Off state).
+--  - [Flash]:  Connect this to a Momentary Button or Keypad input.
+--    (This controls your High Beam Flash).
+--
+--3. WIRING OUTPUTS (Visuals):
+--   - The chip outputs data for a "Wire Sprite" or "Wire Lamp".
+--   - Create a Wire Sprite/Lamp at the front of your car.
+--   - Connect [Color] on the Sprite -> To [Color] on the Chip.
+--   - Connect [Size]  on the Sprite -> To [Size]  on the Chip.
+--   - Connect [Alpha] on the Sprite -> To [Alpha] on the Chip.
+--
+--4. OPTIONAL OUTPUTS:
+--   - [Aim_Angle]: Connect this to a Hologram if you want physical headlight 
+--     housings that move/tilt with the beam.
+--   - [Active]: Connect this to a dashboard indicator light (1 = On).
+--   - [State]:  Connect this to a debug screen (0=Off, 1=Low, 2=High).
+--
+--================================================================================
+--
+--[III. CONFIGURATION GUIDE]
+----------------------------------------------------------------------------------
+--All settings are found at the top of the Starfall code in the "CONFIG" table.
+--
+--1. VISUAL STYLE (Light_Tech):
+--   - "MODERN":  Starts Deep Blue (Xenon), fades to White. Sharp cutoff.
+--   - "CLASSIC": Starts Dim Orange (Halogen), fades to Warm White. Softer.
+--   - "SIMPLE":  Instant White light. No thermal simulation.
+--
+--2. FLARE INTENSITY (Sprite_Boost):
+--   - Controls how "glowing" the sprite looks.
+--   - Default: 5.0
+--   - If sprites look like "Dark Smoke" or "Fog", INCREASE this value (e.g., 8.0).
+--   - If sprites are blindingly white, DECREASE this value (e.g., 3.0).
+--
+--3. FADE SPEED (Warm_Fade_Speed):
+--   - Controls how fast the lights warm up.
+--   - Lower (20) = Slow, dramatic warm-up.
+--   - Higher (100) = Fast, snappy warm-up.
+--   - Note: High Beams always use a separate "Flash_Fade_Speed" (150) for safety.
+--
+--4. POSITIONING:
+--   - Offset_Right: Distance from the center of the chip to the right headlight.
+--   - Offset_Forward: Distance from the chip to the front of the car.
+--   - Offset_Up: Vertical height offset.
+--
+--================================================================================
+
+-- [SYSTEM CORE] -----------------------------------------------------------
+-- DO NOT TOUCH BELOW THIS LINE.
+local h,n,t,m,c=hook,net,timer,math,chip() local V,A,C=Vector,Angle,Color local w,l,hol,p=wire,light,hologram,player() local mm,mx,mc,lv,la=m.min,m.max,m.clamp,m.lerpVector,m.lerpAngle local ft,ct=t.frametime,t.curtime local ltw,ltwa=c.localToWorld,c.localToWorldAngles local BA=A(Cfg.Rotate_Pitch,Cfg.Rotate_Yaw,Cfg.Rotate_Roll) local LR=mx(Cfg.Bright_Targets[1],1) local SzT={[0]=0,[1]=Cfg.Sprite_Size_Low,[2]=Cfg.Sprite_Size_High} local function MT(c,t,s) return c<t and mm(c+s,t) or mx(c-s,t) end if SERVER then w.adjustPorts({Toggle="NORMAL",Flash="NORMAL"},{Active="NORMAL",State="NORMAL",Color="VECTOR",Alpha="NORMAL",Size="NORMAL",Aim_Angle="ANGLE"}) w.ports.Color=V(0,0,0) w.ports.Alpha=255 local S,B,Z,Tp,O,Cd,L,Sl,lT,lF,pS=0,0,0,0,-9e9,true,0,false,0,0,0 local function Sy() n.start("L") n.writeUInt(S,2) n.send() end c:setColor(C(255,255,255)) c:setMaterial("") h.add("input","I",function(k,v) if k=="Toggle" then if Cfg.Use_Toggle then if v~=lT then S=(S+1)%3 Sy() end else if v>0 and lT==0 then S=(S+1)%3 Sy() end end lT=v elseif k=="Flash" then if v>0 and lF==0 then pS=S S=2 Sy() elseif v==0 and lF>0 then S=pS Sy() end lF=v end end) h.add("tick","K",function() if S==0 and B<=0.01 then if ct()-O>Cfg.Sleep_Timeout then if not Sl then w.ports.Color=V(0,0,0) w.ports.Size,w.ports.Active=0,0 Sl=true Tp=0 end return end end Sl=false local dt=ft() if S~=L then if L==0 and S>0 then if S==2 then Cd=false else Cd=(ct()-O>Cfg.Cold_Timeout) end end if S==0 then O=ct() end L=S end if S==2 then Cd=false end if Cd and Tp>=0.99 then Cd=false end local sp=(S==2 or B>Cfg.Bright_Targets[1]) and Cfg.Flash_Fade_Speed or (Cd and (Cfg.Light_Tech=="MODERN" and 2 or 8) or Cfg.Warm_Fade_Speed) local st=dt*sp B=MT(B,Cfg.Bright_Targets[S]or 0,st) Tp=MT(Tp,S>0 and 1 or 0,st*0.05) Z=MT(Z,SzT[S]or 0,st*0.02) local r=mc(Tp,0,1) local cl=(Cfg.Light_Tech=="SIMPLE") and Cfg.Simple.Color_White or (not Cd and (Cfg.Light_Tech=="MODERN" and Cfg.Modern.Color_Run or Cfg.Classic.Color_Run) or lv(r,Cfg.Modern.Color_Ignition,Cfg.Classic.Color_Dim)) w.ports.Active=S>0 and 1 or 0 w.ports.State=S w.ports.Color=(cl*(Cfg.Brightness_Mults[S]or 0))*Cfg.Sprite_Boost w.ports.Alpha=255 w.ports.Size=(S==0) and 0 or Z*mm(B/LR,1) w.ports.Aim_Angle=ltwa(c,A(BA.p+((Cfg.Light_Tech=="MODERN" and S==2) and Cfg.Modern.High_Beam_Lift or 0),BA.y,BA.r)) end) t.create("A",2,0,Sy) else local M,B,F,Tp,Ls,O,Cd,Lm,sL,sR,sA=0,0,Cfg.FOV_Low,0,{L=nil,R=nil},-9e9,true,0,V(0,0,0),V(0,0,0),A(0,0,0) local vO=V(Cfg.Offset_Forward,0,Cfg.Offset_Up) n.receive("L",function() M=n.readUInt(2) end) h.add("tick","R",function() if M==0 and B<=0.01 then if ct()-O>Cfg.Sleep_Timeout then if Ls.L then Ls.L:remove() Ls.L=nil end if Ls.R then Ls.R:remove() Ls.R=nil end Tp=0 return end end if p:getPos():getDistanceSqr(c:getPos())>Cfg.LOD_Distance^2 then if Ls.L then Ls.L:remove() Ls.L=nil end if Ls.R then Ls.R:remove() Ls.R=nil end return end if not (Ls.L and Ls.L:isValid()) then Ls.L=l.createProjected() if Ls.L then Ls.L:setFarZ(Cfg.FarZ) Ls.L:setTexture(Cfg.Texture) Ls.L:setEnableShadows(Cfg.Shadows) end end if not (Ls.R and Ls.R:isValid()) then Ls.R=l.createProjected() if Ls.R then Ls.R:setFarZ(Cfg.FarZ) Ls.R:setTexture(Cfg.Texture) Ls.R:setEnableShadows(Cfg.Shadows) end end local dt=ft() if M~=Lm then if Lm==0 and M>0 then if M==2 then Cd=false else Cd=(ct()-O>Cfg.Cold_Timeout) end end if M==0 then O=ct() end Lm=M end if M==2 then Cd=false end if Cd and Tp>=0.99 then Cd=false end local sp=(M==2 or B>Cfg.Bright_Targets[1]) and Cfg.Flash_Fade_Speed or (Cd and (Cfg.Light_Tech=="MODERN" and 2 or 8) or Cfg.Warm_Fade_Speed) local st=dt*sp B=MT(B,Cfg.Bright_Targets[M]or 0,st) F=MT(F,(M==2) and Cfg.FOV_High or Cfg.FOV_Low,st*2) Tp=MT(Tp,M>0 and 1 or 0,st*0.05) local r=mc(Tp,0,1) local cl=(Cfg.Light_Tech=="SIMPLE") and Cfg.Simple.Color_White or (not Cd and (Cfg.Light_Tech=="MODERN" and Cfg.Modern.Color_Run or Cfg.Classic.Color_Run) or lv(r,Cfg.Modern.Color_Ignition,Cfg.Classic.Color_Dim)) local cP=ltw(c,vO) local rV=c:getRight()*Cfg.Offset_Right local tL=cP+rV local tR=cP-rV local tA=ltwa(c,A(BA.p+((Cfg.Light_Tech=="MODERN" and M==2) and Cfg.Modern.High_Beam_Lift or 0),BA.y,BA.r)) if sL==V(0,0,0) then sL=tL sR=tR sA=tA end local k=Cfg.Beam_Smoothing sL=lv(k,sL,tL) sR=lv(k,sR,tR) sA=la(k,sA,tA) local fC=C(cl.x,cl.y,cl.z) if Ls.L and Ls.L:isValid() then Ls.L:setPos(sL) Ls.L:setAngles(sA) Ls.L:setBrightness(B) Ls.L:setFOV(F) Ls.L:setColor(fC) Ls.L:update() end if Ls.R and Ls.R:isValid() then Ls.R:setPos(sR) Ls.R:setAngles(sA) Ls.R:setBrightness(B) Ls.R:setFOV(F) Ls.R:setColor(fC) Ls.R:update() end end) end
