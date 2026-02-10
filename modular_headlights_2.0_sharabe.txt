@@ -1,0 +1,83 @@
+--@name Modular Headlights 2.0 Sharabe
+--@author Gemini
+--@shared
+
+-- [DESCRIPTION] ---------------------------------------------------
+-- A high-fidelity headlight controller designed for visual realism and 
+-- network performance. Features "Cold-Start" warm-up sequences, 
+-- auto-leveling beams, and lag-free smoothing.
+--
+-- [WIRING GUIDE]
+-- 1. INPUTS:
+--    - [Toggle]: Connect to a LATCHING switch (Main On/Off).
+--    - [Flash]:  Connect to a MOMENTARY button (High Beam Flash).
+--
+-- 2. OUTPUTS (Wire to a "Wire Sprite"):
+--    - [Red/Green/Blue]: Connect to Sprite Color inputs.
+--    - [Alpha]: Connect to Sprite Alpha (Crucial for visibility).
+--    - [Size]:  Connect to Sprite Size (Controls beam expansion).
+--
+-- [NOTE]: This chip includes a "Safety Start" protocol. If the lights
+-- spawn ON, simply toggle your switch Off/On to sync the system.
+---------------------------------------------------------------------------
+
+-- [CONFIGURATION] --------------------------------------------------------
+local CONFIG = {
+    -- [POSITIONING] 
+    Offset_Right = 35,   -- Distance from center to side
+    Offset_Forward = 10, -- Distance forward from chip
+    Offset_Up = 0,       -- Height offset
+    
+    -- [ROTATION]
+    Rotate_Pitch = -90,  -- Vertical aim (Pitch)
+    Rotate_Yaw   = 90,   -- Horizontal aim (Yaw)
+    Rotate_Roll  = 0,    -- Tilt (Roll)
+
+    -- [SPRITE TUNING]
+    Sprite_Scale = 0.6,  -- Master size multiplier for the lens flare
+    
+    -- [DIMMING PROFILES] (Index 0: Off | 1: Low | 2: High)
+    -- Controls brightness (0.0 to 1.0) and size (0.0 to 1.0) per state
+    Brightness_Mults = { [0] = 0.0, [1] = 0.10, [2] = 0.40 },
+    Size_Mults       = { [0] = 0.0, [1] = 0.50, [2] = 1.00 },
+
+    -- [MOTION]
+    Beam_Smoothing = 0.6, -- Lag effect on beams (0 = Rigid, 1 = Loose)
+
+    -- [VISIBILITY]
+    Show_Chip_Model = false, -- Draw the Starfall chip itself?
+    Show_LED_Models = true,  -- Draw the small physical LED dots?
+    
+    -- [TECH STYLE]
+    -- Options: "MODERN" (Xenon), "CLASSIC" (Halogen), "SIMPLE" (White)
+    Light_Tech = "MODERN", 
+
+    -- [TIMING]
+    Cold_Timeout = 300,   -- Seconds off before "Cold Start" triggers again
+    Warm_Fade_Speed = 50, -- Speed of light fade when already warm
+
+    -- [CONTROLS]
+    Use_Toggle_Switch = true, -- Set to false if using a button for main power
+    
+    -- [PROJECTED LIGHTS] (The actual beams on the wall)
+    Texture = "effects/flashlight/soft", 
+    NearZ = 10, 
+    FarZ = 2000,          -- Max render distance of beam
+    FOV_Low = 90,         -- Beam width (Low Beam)
+    FOV_High = 110,       -- Beam width (High Beam)
+    Brightness_Low = 4,   -- Projection intensity (Low)
+    Brightness_High = 8,  -- Projection intensity (High)
+    
+    -- [COLOR PALETTES] (RGB Vectors)
+    Classic = { Color_Dim = Vector(255, 140, 40), Color_Run = Vector(255, 240, 220) },
+    Modern  = { Color_Ignition = Vector(0, 100, 255), Color_Run = Vector(220, 235, 255), High_Beam_Lift = -3 },
+    Simple  = { Color_White = Vector(255, 255, 255) },
+    
+    -- [SYSTEM]
+    LED_Model = "models/fasteroid/led_mini.mdl",
+    LED_Scale = 0.5,
+    LOD_Distance = 4000 -- Dist at which lights stop rendering (Saves FPS)
+}
+---------------------------------------------------------------------------
+-- [CORE LOGIC]
+local h,n,t,m,c,V,A,C,p,w,l,hol=hook,net,timer,math,chip(),Vector,Angle,Color,player(),wire,light,hologram;local BAng=A(CONFIG.Rotate_Pitch,CONFIG.Rotate_Yaw,CONFIG.Rotate_Roll);local function Calc(M,B,Cld,d)local tB,S,pM,K,oC=0,50,0,CONFIG.Light_Tech;if M==1 then tB=CONFIG.Brightness_Low elseif M==2 then tB=CONFIG.Brightness_High end;if K=="SIMPLE"then S=15 elseif Cld then if K=="MODERN"then S=2 elseif K=="CLASSIC"then S=8 end else S=CONFIG.Warm_Fade_Speed end;if K=="MODERN"and M==2 then pM=CONFIG.Modern.High_Beam_Lift end;local st=d*S;if B<tB then B=m.min(B+st,tB)elseif B>tB then B=m.max(B-st,tB)end;if K=="SIMPLE"then oC=CONFIG.Simple.Color_White elseif not Cld then oC=(K=="MODERN")and CONFIG.Modern.Color_Run or CONFIG.Classic.Color_Run else local r=m.clamp(B/CONFIG.Brightness_High,0,1);if K=="MODERN"then oC=m.lerpVector(r,CONFIG.Modern.Color_Ignition,CONFIG.Modern.Color_Run)else oC=m.lerpVector(r,CONFIG.Classic.Color_Dim,CONFIG.Classic.Color_Run)end end;return B,oC,pM end;local function iv(e)return e and e:isValid()end;if SERVER then w.adjustPorts({Toggle="NORMAL",Flash="NORMAL"},{Active="NORMAL",State="NORMAL",Red="NORMAL",Green="NORMAL",Blue="NORMAL",Alpha="NORMAL",Size="NORMAL",Aim_Angle="ANGLE"});w.ports.Red=0;w.ports.Green=0;w.ports.Blue=0;w.ports.Alpha=255;w.ports.Size=0;w.ports.Active=0;local St,Hols,CB,LOT,IC,LM,lT,lF,pF=0,{L=nil,R=nil},0,-9999,true,0,w.ports.Toggle or 0,w.ports.Flash or 0,0;if not CONFIG.Show_Chip_Model then c:setColor(C(0,0,0,0));c:setMaterial("models/effects/vol_light001")else c:setColor(C(255,255,255,255));c:setMaterial("")end;local function sy()n.start("LS");n.writeUInt(St,2);n.send();if CONFIG.Show_LED_Models then local lP,rP=V(CONFIG.Offset_Forward,CONFIG.Offset_Right,CONFIG.Offset_Up),V(CONFIG.Offset_Forward,-CONFIG.Offset_Right,CONFIG.Offset_Up);if not iv(Hols.L)then Hols.L=hol.create(c:localToWorld(lP),c:getAngles(),CONFIG.LED_Model);Hols.L:setScale(V(CONFIG.LED_Scale));Hols.L:setParent(c)end;if not iv(Hols.R)then Hols.R=hol.create(c:localToWorld(rP),c:getAngles(),CONFIG.LED_Model);Hols.R:setScale(V(CONFIG.LED_Scale));Hols.R:setParent(c)end;local cl=(St>0)and C(255,255,255)or C(50,50,50);if iv(Hols.L)then Hols.L:setColor(cl)end;if iv(Hols.R)then Hols.R:setColor(cl)end else if iv(Hols.L)then Hols.L:remove()end;if iv(Hols.R)then Hols.R:remove()end end end;h.add("tick","L",function()if St~=LM then if LM==0 and St>0 then local to=t.curtime()-LOT;IC=(to>CONFIG.Cold_Timeout)end;if St==0 then LOT=t.curtime()end;LM=St end;local x,y;CB,x,y=Calc(St,CB,IC,t.frametime());local fA=A(BAng.p+y,BAng.y,BAng.r);w.ports.Active=(St>0)and 1 or 0;w.ports.State=St;local dM,sM=CONFIG.Brightness_Mults[St]or 0,CONFIG.Size_Mults[St]or 0;local sC=x*dM;w.ports.Red=sC.x;w.ports.Green=sC.y;w.ports.Blue=sC.z;w.ports.Alpha=255;local rt=(CONFIG.Brightness_Low>0)and m.min(CB/CONFIG.Brightness_Low,1)or 0;w.ports.Size=(CONFIG.Sprite_Scale*sM)*rt;w.ports.Aim_Angle=c:localToWorldAngles(fA)end);h.add("input","I",function(nm,v)if nm=="Toggle"then if CONFIG.Use_Toggle_Switch then if v~=lT then St=(St+1)%3;sy()end else if v>0 and lT==0 then St=(St+1)%3;sy()end end;lT=v elseif nm=="Flash"then if v>0 and lF==0 then pF=St;St=2;sy()elseif v==0 and lF>0 then St=pF;sy()end;lF=v end end);t.create("K",2,0,sy)else local M,CB,Lps,LOT,IC,LM,LDS=0,0,{L=nil,R=nil},-9999,true,0,CONFIG.LOD_Distance^2;local sL,sR,sA,vO=V(0,0,0),V(0,0,0),A(0,0,0),V(CONFIG.Offset_Forward,0,CONFIG.Offset_Up);n.receive("LS",function()M=n.readUInt(2)end);h.add("tick","R",function()if p:getPos():getDistanceSqr(c:getPos())>LDS then if Lps.L then Lps.L:remove();Lps.L=nil end;if Lps.R then Lps.R:remove();Lps.R=nil end return end;if not Lps.L then Lps.L=l.createProjected();if Lps.L then Lps.L:setFarZ(CONFIG.FarZ);Lps.L:setTexture(CONFIG.Texture);Lps.L:setEnableShadows(false)end end;if not Lps.R then Lps.R=l.createProjected();if Lps.R then Lps.R:setFarZ(CONFIG.FarZ);Lps.R:setTexture(CONFIG.Texture);Lps.R:setEnableShadows(false)end end;if M~=LM then if LM==0 and M>0 then local to=t.curtime()-LOT;IC=(to>CONFIG.Cold_Timeout)end;if M==0 then LOT=t.curtime()end;LM=M end;local x,y;CB,x,y=Calc(M,CB,IC,t.frametime());CB=x.x and CB or CB;local cP,rV=c:localToWorld(vO),c:getRight()*CONFIG.Offset_Right;local tL,tR=cP+rV,cP-rV;local fA=A(BAng.p+y,BAng.y,BAng.r);local tA=c:localToWorldAngles(fA);if sL==V(0,0,0)then sL=tL;sR=tR;sA=tA end;local k=CONFIG.Beam_Smoothing;sL=m.lerpVector(k,sL,tL);sR=m.lerpVector(k,sR,tR);sA=m.lerpAngle(k,sA,tA);local fC,fv=C(x.x,x.y,x.z),(M==2)and CONFIG.FOV_High or CONFIG.FOV_Low;if iv(Lps.L)then Lps.L:setPos(sL);Lps.L:setAngles(sA);Lps.L:setBrightness(CB);Lps.L:setFOV(fv);Lps.L:setColor(fC);Lps.L:update()end;if iv(Lps.R)then Lps.R:setPos(sR);Lps.R:setAngles(sA);Lps.R:setBrightness(CB);Lps.R:setFOV(fv);Lps.R:setColor(fC);Lps.R:update()end end
