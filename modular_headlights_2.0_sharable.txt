@@ -33,7 +33,7 @@ local Cfg = {
     -- [VISUAL INTENSITY]
     Sprite_Boost     = 5.0,  -- Flare Intensity (Higher = More Glow, Less Fog)
     
-    -- [NEW] SPRITE SIZES (Independent Tuning)
+    --SPRITE SIZES (Independent Tuning)
     Sprite_Size_Low  = 0.3,  -- Size of the flare in Low Beam
     Sprite_Size_High = 0.4,  -- Size of the flare in High Beam
     
