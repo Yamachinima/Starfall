@@ -1,0 +1,34 @@
+==========================================================
+ADVANCED TANK TURRET - WIRING INSTRUCTIONS
+==========================================================
+
+[ WIRE INPUTS ]
+* Base (ENTITY)         : Wire to the main physical chassis/hull of the tank.
+* Torso (ENTITY)        : Wire to the physical turret prop that sits on the base.
+* LeftGun (ENTITY)      : Wire to the left main gun prop.
+* RightGun (ENTITY)     : Wire to the right main gun prop.
+* Seat (ENTITY)         : Wire to the driver's vehicle seat/pod.
+* FPV_Prop (ENTITY)     : Wire to an invisible prop placed where the first-person camera should be.
+* TPV_Prop (ENTITY)     : Wire to an invisible prop placed where the third-person camera should be.
+* ViewMode (NORMAL)     : Wire to a toggle (e.g., Wire Button or Pod Controller) to switch camera modes.
+* LeftSentry (ENTITY)   : Wire to the left AI sentry base prop.
+* RightSentry (ENTITY)  : Wire to the right AI sentry base prop.
+* LeftMinigun (ENTITY)  : Wire to the spinning barrel prop on the left sentry.
+* RightMinigun (ENTITY) : Wire to the spinning barrel prop on the right sentry.
+* SentryEnable (NORMAL) : Wire to a toggle switch to turn the AI targeting on/off.
+
+[ WIRE OUTPUTS ]
+* CamPos (VECTOR)       : Wire to the Cam Controller's Position input.
+* CamAng (ANGLE)        : Wire to the Cam Controller's Angle input.
+* Active (NORMAL)       : Wire to the Cam Controller's Activated input (links camera to seat occupancy).
+* CamParent (ENTITY)    : Optional. Use if dynamically swapping camera parenting via external logic.
+* LeftFire (NORMAL)     : Wire to the firing mechanism (e.g., Turret tool or Emitter) for the left sentry.
+* RightFire (NORMAL)    : Wire to the firing mechanism for the right sentry.
+
+[ INSTALLATION WORKFLOW ]
+1. Spawn your physical constraints (Base, Torso, Guns, Sentries).
+2. Ensure props that need to rotate (Torso, Guns, Minigun barrels) have proper spherical/axis ballsocket constraints so they don't fight the physics engine when the chip sets their angles.
+3. Place the StarfallEx chip containing the code onto the Base.
+4. Equip the Wire tool and strictly follow the input list above, linking the chip's inputs to their respective entities on the contraption.
+5. Link your weapons and camera controllers to the chip's outputs.
+6. Trigger the SentryEnable input to initialize the radar loop.

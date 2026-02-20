@@ -1,0 +1,213 @@
+--@name Advanced Tank Turret (User Friendly)
+--@author Yamachinima
+--@server
+
+-- ==========================================================
+-- MASTER CONFIGURATION TABLE (ADJUSTABLE SETTINGS)
+-- ==========================================================
+local CFG = {
+    -- [ MAIN TURRET KINEMATICS ] --
+    YAW_SPEED        = 0.4,   -- Math approach speed for hull yaw tracking.
+    PITCH_SPEED      = 0.3,   -- Math approach speed for gun elevation/depression.
+    TORSO_OFFSET     = 90,    -- Baseline angular offset to align the physical base torso.
+    PITCH_MIN        = -45,   -- Maximum gun depression angle (prevents chassis clipping).
+    PITCH_MAX        = 45,    -- Maximum gun elevation angle.
+
+    -- [ AI SENTRY TARGETING & RADAR ] --
+    SENTRY_RANGE     = 1500,  -- Maximum outer radius for AI engagement zone.
+    SENTRY_MIN_RANGE = 250,   -- Inner deadzone radius where sentries will ignore targets.
+    S_MIN_RANGE_SQR  = 250 * 250,   -- Pre-calculated squared deadzone distance (CPU optimization).
+    SENTRY_RANGE_SQR = 1500 * 1500, -- Pre-calculated squared outer distance.
+    
+    SENTRY_FOV       = 220,   -- Deprecated/Orphaned: Field of view for sentry targeting.
+    SENTRY_LOCK_TIME = 5.0,   -- Deprecated/Orphaned: Time required to establish a target lock.
+    SENTRY_SWEEP_SPD = 0.8,   -- Frequency scalar for the sine wave driving idle scanning motion.
+    SENTRY_SMOOTH    = 1.5,   -- Interpolation speed governing how aggressively sentries snap to targets.
+    RADAR_RATE       = 0.2,   -- Internal cooldown (seconds) between find.inSphere executions.
+    EXEMPT_PLAYERS   = true,  -- Boolean: True forces the targeting loop to ignore player entities.
+    
+    -- [ SENTRY MINIGUN MECHANICS ] --
+    MG_ACCEL         = 0.6,   -- Rate of internal mgSpin increase (spool-up simulation).
+    MG_DECEL         = 0.4,   -- Rate of internal mgSpin decrease (spool-down simulation).
+    MG_MAX_VEL       = 40,    -- Absolute maximum rotation speed applied to the barrel prop.
+    S_PITCH_MIN      = -45,   -- Sentry-isolated maximum gun depression.
+    S_PITCH_MAX      = 45,    -- Sentry-isolated maximum gun elevation.
+
+    L_IDLE_YAW       = 180,   -- Default resting yaw angle for the left sentry.
+    R_IDLE_YAW       = 0,     -- Default resting yaw angle for the right sentry.
+    L_AIM_OFFSET     = 270,   -- Rotational offset to correct localized target vectors (Left).
+    R_AIM_OFFSET     = 270,   -- Rotational offset to correct localized target vectors (Right).
+    LIMIT_ARC        = 110,   -- Maximum rotational degree sentries can turn from idle positions.
+    
+    -- [ AUDIO SYSTEM MODULATION ] --
+    VOL_ENGINE       = 1.00,  -- Baseline amplitude scalar for engine looping sound.
+    VOL_TORSO        = 0.60,  -- Baseline amplitude scalar for torso rotation sound.
+    VOL_GUN          = 0.40,  -- Baseline amplitude scalar for gun elevation sound.
+    VOL_IMPACT       = 1.00,  -- Baseline amplitude scalar for physical chassis impacts.
+    
+    SND_ENGINE       = "vehicles/airboat/fan_motor_idle_loop1.wav", -- Engine WAV path.
+    SND_TORSO        = "vehicles/crane/crane_extend_loop1.wav",     -- Torso WAV path.
+    SND_GUN          = "vehicles/tank_turret_loop1.wav",            -- Gun WAV path.
+    SND_IMPACT       = "physics/concrete/boulder_impact_hard4.wav", -- Impact WAV path.
+    
+    PITCH_ENG_MIN    = 40,    -- Minimum pitch clamp for dynamic engine sound.
+    PITCH_ENG_MAX    = 85,    -- Maximum pitch clamp for dynamic engine sound.
+    PITCH_TORSO_BASE = 70,    -- Baseline pitch for torso movement audio.
+    PITCH_GUN_BASE   = 180,   -- Baseline pitch for main gun elevation audio.
+    PITCH_GUN_MAX    = 200,   -- Maximum pitch clamp for main gun elevation audio.
+    VEL_SCALAR       = 0.08   -- Multiplier applied to hull velocity to dynamically shift engine pitch.
+}
+
+-- ==========================================================
+-- === CORE CODE DO NOT MODIFY ===
+-- ==========================================================
+local isValid, approach, normalize, clamp, abs = isValid, math.approachAngle, math.normalizeAngle, math.clamp, math.abs
+local math_sin, math_atan2, math_deg, math_sqrt = math.sin, math.atan2, math.deg, math.sqrt
+local Angle, Vector, curTime = Angle, Vector, timer.curtime
+local trace_line, find_inSphere = trace.line, find.inSphere
+
+local function getCenter(ent) return ent:getPos() + ent:getUp() * 10 end
+
+local ST = { tYaw = 0, sYaw = 0, sPitch = 0, init = false, lLocYaw = 0, vTog = false, lView = 0, nRScan = 0, sentryActive = false, lastSInp = 0, lastVelZ = 0, engPlaying = false }
+local L_BRAIN = { target = nil, lockStart = 0, cYaw = CFG.L_IDLE_YAW, cPitch = 0, isSweeping = false, mgSpin = 0, mgAng = 0 }
+local R_BRAIN = { target = nil, lockStart = 0, cYaw = CFG.R_IDLE_YAW, cPitch = 0, isSweeping = false, mgSpin = 0, mgAng = 0 }
+local SND = { engine = nil, torso = nil, gun = nil }
+local MY_CHIP = chip()
+local TRACE_FILTER = { MY_CHIP, nil, nil, nil, nil, nil }
+
+wire.adjustInputs(
+    {"Base", "Torso", "LeftGun", "RightGun", "Seat", "FPV_Prop", "TPV_Prop", "ViewMode", "LeftSentry", "RightSentry", "LeftMinigun", "RightMinigun", "SentryEnable"}, 
+    {"ENTITY", "ENTITY", "ENTITY", "ENTITY", "ENTITY", "ENTITY", "ENTITY", "NORMAL", "ENTITY", "ENTITY", "ENTITY", "ENTITY", "NORMAL"}
+)
+wire.adjustOutputs(
+    {"CamPos", "CamAng", "Active", "CamParent", "LeftFire", "RightFire"}, 
+    {"VECTOR", "ANGLE", "NORMAL", "ENTITY", "NORMAL", "NORMAL"}
+)
+local ports = wire.ports
+
+hook.add("tick", "main", function()
+    local Base, Torso = ports.Base, ports.Torso
+    if not (isValid(Base) and isValid(Torso)) then return end
+
+    local Seat = ports.Seat
+    local driver = (isValid(Seat) and isValid(Seat:getDriver())) and Seat:getDriver() or nil
+    local now, bPos, hullAng = curTime(), Base:getPos(), Base:getAngles()
+    local aimAng = driver and driver:getEyeAngles() or hullAng
+    
+    if not ST.init then
+        ST.tYaw, ST.sYaw = aimAng.y, aimAng.y
+        ST.lLocYaw = normalize(aimAng.y - hullAng.y)
+        SND.engine = sound.create(Base, CFG.SND_ENGINE)
+        SND.torso = sound.create(Torso, CFG.SND_TORSO)
+        if SND.torso then SND.torso:play() SND.torso:setVolume(0) end
+        SND.gun = sound.create(Torso, CFG.SND_GUN)
+        if SND.gun then SND.gun:play() SND.gun:setVolume(0) end
+        ST.init = true
+    end
+
+    local curVelZ = Base:getVelocity().z
+    if ST.lastVelZ < -300 and (curVelZ - ST.lastVelZ) > 250 then Base:emitSound(CFG.SND_IMPACT, 100, 100, CFG.VOL_IMPACT) end
+    ST.lastVelZ = curVelZ
+
+    local sInp = ports.SentryEnable
+    if sInp > 0 and ST.lastSInp == 0 then ST.sentryActive = not ST.sentryActive end
+    ST.lastSInp = sInp
+
+    if driver then
+        local curLocalY = normalize(aimAng.y - hullAng.y)
+        ST.tYaw = normalize(ST.tYaw + normalize(curLocalY - ST.lLocYaw))
+        ST.lLocYaw = curLocalY
+    else ST.tYaw = hullAng.y end
+
+    ST.sYaw = approach(ST.sYaw, ST.tYaw, CFG.YAW_SPEED)
+    Torso:setAngles(Base:localToWorldAngles(Angle(0, normalize(ST.sYaw - hullAng.y) + CFG.TORSO_OFFSET, 0)))
+
+    local LG, RG = ports.LeftGun, ports.RightGun
+    local targetP = driver and clamp(normalize(Torso:worldToLocalAngles(aimAng).p), CFG.PITCH_MIN, CFG.PITCH_MAX) or 0
+    if isValid(LG) and isValid(RG) then
+        ST.sPitch = approach(ST.sPitch, targetP, CFG.PITCH_SPEED)
+        LG:setAngles(Torso:localToWorldAngles(Angle(0, 0, 90) + Angle(0, 0, -ST.sPitch)))
+        RG:setAngles(Torso:localToWorldAngles(Angle(0, 180, -90) + Angle(0, 0, ST.sPitch)))
+    end
+
+    if SND.engine then
+        if driver then
+            if not ST.engPlaying then SND.engine:play() ST.engPlaying = true end
+            SND.engine:setPitch(clamp(CFG.PITCH_ENG_MIN + Base:getVelocity():getLength() * CFG.VEL_SCALAR, CFG.PITCH_ENG_MIN, CFG.PITCH_ENG_MAX))
+            SND.engine:setVolume(CFG.VOL_ENGINE)
+        elseif ST.engPlaying then SND.engine:stop() ST.engPlaying = false end
+    end
+    
+    if SND.torso then
+        local dY = abs(normalize(ST.tYaw - ST.sYaw))
+        if dY > 0.1 then SND.torso:setVolume(CFG.VOL_TORSO) SND.torso:setPitch(CFG.PITCH_TORSO_BASE + clamp(dY * 1.5, 0, 30))
+        else SND.torso:setVolume(0) end
+    end
+    
+    if SND.gun then
+        local dP = abs(normalize(targetP - ST.sPitch))
+        if dP > 0.1 then SND.gun:setVolume(CFG.VOL_GUN) SND.gun:setPitch(clamp(CFG.PITCH_GUN_BASE + dP * 2, CFG.PITCH_GUN_BASE, CFG.PITCH_GUN_MAX))
+        else SND.gun:setVolume(0) end
+    end
+
+    local LS, RS = ports.LeftSentry, ports.RightSentry
+    if ST.sentryActive and isValid(LS) and isValid(RS) then
+        if now > ST.nRScan then
+            TRACE_FILTER[2], TRACE_FILTER[3], TRACE_FILTER[4], TRACE_FILTER[5], TRACE_FILTER[6] = Base, Torso, LS, RS, driver
+            local targets, bL, bR = find_inSphere(bPos, CFG.SENTRY_RANGE), nil, nil
+            local dLsq, dRsq = CFG.SENTRY_RANGE_SQR, CFG.SENTRY_RANGE_SQR
+            for i = 1, #targets do
+                local ent = targets[i]
+                if isValid(ent) and ent:getHealth() > 0 and ent ~= driver then
+                    local isP = ent:isPlayer()
+                    if not (CFG.EXEMPT_PLAYERS and isP) and (isP or ent:isNPC()) then
+                        local ePos = getCenter(ent)
+                        local dSqr = ePos:getDistanceSqr(bPos)
+                        if dSqr > CFG.S_MIN_RANGE_SQR then
+                            local lV = Base:worldToLocal(ePos)
+                            local rawY = math_deg(math_atan2(lV.y, lV.x))
+                            if dSqr < dLsq and abs(normalize(normalize(rawY + CFG.L_AIM_OFFSET) - CFG.L_IDLE_YAW)) <= 110 then
+                                local tr = trace_line(LS:getPos(), ePos, TRACE_FILTER)
+                                if tr.Entity == ent or not tr.Hit then bL = ent dLsq = dSqr end
+                            end
+                            if dSqr < dRsq and abs(normalize(normalize(rawY + CFG.R_AIM_OFFSET) - CFG.R_IDLE_YAW)) <= 110 then
+                                local tr = trace_line(RS:getPos(), ePos, TRACE_FILTER)
+                                if tr.Entity == ent or not tr.Hit then bR = ent dRsq = dSqr end
+                            end
+                        end
+                    end
+                end
+            end
+            L_BRAIN.target, R_BRAIN.target, ST.nRScan = bL, bR, now + CFG.RADAR_RATE
+        end
+
+        local sweep = math_sin(now * CFG.SENTRY_SWEEP_SPD) * (CFG.LIMIT_ARC * 0.8)
+        for _, b in ipairs({ {L_BRAIN, LS, ports.LeftMinigun, CFG.L_IDLE_YAW, CFG.L_AIM_OFFSET, "LeftFire"}, {R_BRAIN, RS, ports.RightMinigun, CFG.R_IDLE_YAW, CFG.R_AIM_OFFSET, "RightFire"} }) do
+            local brain, sent, mini, idleY, offY, outF = b[1], b[2], b[3], b[4], b[5], b[6]
+            local gY, gP = idleY, 0
+            if isValid(brain.target) then
+                local lV = Base:worldToLocal(Base:getPos() + (getCenter(brain.target) - sent:getPos()))
+                gP = clamp(math_deg(math_atan2(lV.z, math_sqrt(lV.x^2 + lV.y^2))), CFG.S_PITCH_MIN, CFG.S_PITCH_MAX)
+                gY = idleY + clamp(normalize(normalize(math_deg(math_atan2(lV.y, lV.x)) + offY) - idleY), -CFG.LIMIT_ARC, CFG.LIMIT_ARC)
+                brain.mgSpin = math.min(brain.mgSpin + CFG.MG_ACCEL, 100)
+                ports[outF] = (brain.mgSpin >= 99) and 1 or 0
+            else
+                brain.mgSpin, ports[outF] = math.max(brain.mgSpin - CFG.MG_DECEL, 0), 0
+                if brain.isSweeping then gY = idleY + sweep elseif abs(normalize(brain.cYaw - idleY)) < 2 then brain.isSweeping = true end
+            end
+            brain.cYaw, brain.cPitch = approach(brain.cYaw, gY, CFG.SENTRY_SMOOTH), approach(brain.cPitch, gP, CFG.SENTRY_SMOOTH)
+            brain.mgAng = normalize(brain.mgAng + (brain.mgSpin / 100) * CFG.MG_MAX_VEL)
+            sent:setAngles(Base:localToWorldAngles(Angle(0, brain.cYaw, 90 + brain.cPitch)))
+            if isValid(mini) then mini:setLocalAngles(Angle(0, brain.mgAng, 0)) end
+        end
+    else
+        ports.LeftFire, ports.RightFire = 0, 0
+        L_BRAIN.mgSpin, R_BRAIN.mgSpin = 0, 0
+    end
+
+    if driver then
+        ports.Active, ports.CamAng = 1, driver:getEyeAngles()
+        local fpv = ports.FPV_Prop
+        ports.CamParent = (ports.ViewMode > 0 and isValid(fpv)) and fpv or ports.TPV_Prop
+    else ports.Active, ports.CamParent = 0, MY_CHIP end
+end)
