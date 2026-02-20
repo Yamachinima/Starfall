@@ -1,0 +1,225 @@
+--@name Modular Headlights
+--@author Yamachinima
+--@shared
+
+-- [I. CONFIGURATION MATRIX]
+local Cfg = {
+    -- [HARDWARE OFFSETS]
+    Offset_Right   = 35,    -- Lateral distance from chip to each headlight (Left/Right).
+    Offset_Forward = 10,    -- Forward distance from chip to the light source.
+    Offset_Up      = 0,     -- Vertical distance from chip to the light source.
+    Rotate_Pitch   = -90,   -- Vertical tilt of the beam (Default -90 is forward-facing).
+    Rotate_Yaw     = 90,    -- Horizontal rotation (Default 90 matches forward on standard chips).
+    Rotate_Roll    = 0,     -- Rotation along the beam axis.
+
+    -- [TECHNOLOGY: "MODERN", "CLASSIC", "SIMPLE"]
+    Light_Tech     = "CLASSIC", -- MODERN: Blue fade. CLASSIC: Halogen fade. SIMPLE: Instant White.
+
+    -- [PALETTES]
+    Classic = { Color_Dim = Vector(255,140,40), Color_Run = Vector(255,240,220) }, 
+    Modern  = { Color_Ignition = Vector(0,100,255), Color_Run = Vector(255,255,255), High_Beam_Lift = -3 }, 
+    Simple  = { Color_White = Vector(255,255,255) }, 
+
+    -- [TIMING & SENSITIVITY]
+    Beam_Smoothing     = 0.8,   
+    Cold_Timeout       = 60,    -- Time (seconds) the car must be OFF before a "Cold Start" happens again.
+    Warm_Fade_Speed    = 50,    
+    Flash_Fade_Speed   = 150,   
+    
+    -- [IGNITION BEHAVIOR]
+    Beam_Ignition_Threshold = 0.05, -- At what point in the fade (0-1) the directional beam strikes the road.
+
+    -- [OPTIMIZATION]
+    Sleep_Timeout      = 300,   
+    LOD_Distance       = 4000,  
+    Sprite_Boost       = 5.0,   
+
+    -- [SPRITE SIZES]
+    Sprite_Size_Low    = 0.3,   
+    Sprite_Size_High   = 0.4,   
+
+    -- [INTERNAL MAPS]
+    Bright_Targets     = { [0]=0.0, [1]=4.0, [2]=8.0 },    
+    Brightness_Mults   = { [0]=0.0, [1]=0.14, [2]=0.18 },  
+
+    -- [PROJECTED LIGHTS]
+    Texture    = "effects/flashlight/soft", 
+    Shadows    = false,  
+    NearZ      = 10,     
+    FarZ       = 2000,   
+    FOV_Low    = 90,     
+    FOV_High   = 110,    
+
+    -- [CONTROLS]
+    Use_Toggle = true,   
+    
+    -- [VISUALS]
+    Hide_Hardware = true 
+}
+
+-- [II. SYSTEM CORE]
+local h, n, t, m, c, w, l, rn = hook, net, timer, math, chip(), wire, light, render
+local V, A, C = Vector, Angle, Color
+local mm, mx, mc, lv, la = m.min, m.max, m.clamp, m.lerpVector, m.lerpAngle
+local ft, ct = t.frametime, t.curtime
+local ltw, ltwa = c.localToWorld, c.localToWorldAngles
+local distSqr = V(0,0,0).getDistanceSqr
+local isValid = function(e) return e and e:isValid() end
+
+local BASE_ANG = A(Cfg.Rotate_Pitch, Cfg.Rotate_Yaw, Cfg.Rotate_Roll)
+local LR       = mx(Cfg.Bright_Targets[1], 1)
+local SZ_MAP   = { [0]=0, [1]=Cfg.Sprite_Size_Low, [2]=Cfg.Sprite_Size_High }
+local V_OFF    = V(Cfg.Offset_Forward, 0, Cfg.Offset_Up)
+
+local function MT(cur, tgt, spd)
+    if cur < tgt then return mm(cur + spd, tgt) else return mx(cur - spd, tgt) end
+end
+
+-- [III. SERVER LOGIC]
+if SERVER then
+    w.adjustPorts({Toggle="NORMAL", Flash="NORMAL"}, {Active="NORMAL", State="NORMAL", Color="VECTOR", Alpha="NORMAL", Size="NORMAL", Aim_Angle="ANGLE"})
+    
+    w.ports.Color, w.ports.Size, w.ports.Alpha = V(0,0,0), 0, 255
+    w.ports.Active, w.ports.State, w.ports.Aim_Angle = 0, 0, A(0,0,0)
+
+    local S, B, Z, Tp, O = 0, 0, 0, 0, -9e9
+    local IsCold, LastT, LastF, BaseS = true, 0, 0, 0
+    local GhostActive = false
+
+    local function Sync() n.start("L") n.writeUInt(S, 2) n.send() end
+
+    if Cfg.Hide_Hardware then c:setNoDraw(true)
+    else c:setNoDraw(false) c:setColor(C(255,255,255)) c:setMaterial("") end
+
+    h.add("input", "I", function(k, v)
+        if k == "Toggle" then
+            if Cfg.Use_Toggle then 
+                if v ~= LastT then BaseS = (BaseS + 1) % 3 end
+            elseif v > 0 and LastT == 0 then 
+                BaseS = (BaseS + 1) % 3 
+            end
+            -- Only update active state if not flashing
+            if LastF == 0 then S = BaseS Sync() end
+            LastT = v
+        elseif k == "Flash" then
+            if v > 0 and LastF == 0 then
+                S = 2 Sync() IsCold = false 
+            elseif v == 0 and LastF > 0 then
+                S = BaseS Sync()
+            end
+            LastF = v
+        end
+    end)
+
+    h.add("tick", "K", function()
+        if not isValid(c) then return end
+        if S == 0 and B <= 0.01 then
+            if ct() - O > Cfg.Sleep_Timeout then
+                if GhostActive then
+                    w.ports.Color, w.ports.Size, w.ports.Active = V(0,0,0), 0, 0
+                    GhostActive, Tp = false, 0
+                end
+                return
+            end
+        end
+        GhostActive = true
+
+        local dt = ft()
+        -- Handle Cold Start logic
+        if S > 0 and S ~= BaseS and LastF == 0 then
+             -- This block handles transitions between Low/High/Off
+        end
+
+        -- Update Cold State Timer
+        if S == 0 then O = ct() end
+        if S > 0 and LastF == 0 then
+            IsCold = (ct() - O > Cfg.Cold_Timeout) and IsCold or false
+        end
+        
+        if IsCold and Tp >= 0.99 then IsCold = false end
+
+        local sp = (S == 2 or B > Cfg.Bright_Targets[1]) and Cfg.Flash_Fade_Speed or (IsCold and (Cfg.Light_Tech == "MODERN" and 2 or 8) or Cfg.Warm_Fade_Speed)
+        local step = dt * sp
+        
+        B = MT(B, Cfg.Bright_Targets[S] or 0, step)
+        Tp = MT(Tp, S > 0 and 1 or 0, step * 0.05)
+        Z = MT(Z, SZ_MAP[S] or 0, step * 0.02)
+
+        local ratio = mc(Tp, 0, 1)
+        local baseCol
+        if Cfg.Light_Tech == "SIMPLE" then baseCol = Cfg.Simple.Color_White
+        elseif not IsCold then baseCol = (Cfg.Light_Tech == "MODERN" and Cfg.Modern.Color_Run or Cfg.Classic.Color_Run)
+        elseif Cfg.Light_Tech == "MODERN" then baseCol = lv(ratio, Cfg.Modern.Color_Ignition, Cfg.Modern.Color_Run)
+        else baseCol = lv(ratio, Cfg.Classic.Color_Dim, Cfg.Classic.Color_Run) end
+
+        w.ports.Color     = (baseCol * (Cfg.Brightness_Mults[S] or 0)) * Cfg.Sprite_Boost
+        w.ports.Alpha     = 255
+        w.ports.Active    = S > 0 and 1 or 0
+        w.ports.State     = S
+        w.ports.Size      = (S == 0) and 0 or Z * mm(B/LR, 1)
+        
+        local lift = (Cfg.Light_Tech == "MODERN" and S == 2) and Cfg.Modern.High_Beam_Lift or 0
+        w.ports.Aim_Angle = ltwa(c, A(BASE_ANG.p + lift, BASE_ANG.y, BASE_ANG.r))
+    end)
+    t.create("Init", 2, 0, Sync)
+
+-- [IV. CLIENT LOGIC]
+else
+    local M, B, F, Tp, O = 0, 0, Cfg.FOV_Low, 0, -9e9
+    local IsCold, Lm = true, 0
+    local Ls = { L = nil, R = nil }
+    local sL, sR, sA = V(0,0,0), V(0,0,0), A(0,0,0)
+
+    n.receive("L", function() M = n.readUInt(2) end)
+
+    h.add("tick", "R", function()
+        if M == 0 and B <= 0.01 and ct() - O > Cfg.Sleep_Timeout then
+            if Ls.L then Ls.L:remove(); Ls.L = nil end
+            if Ls.R then Ls.R:remove(); Ls.R = nil end
+            Tp = 0 return
+        end
+        if distSqr(rn.getEyePos(), c:getPos()) > Cfg.LOD_Distance^2 then
+            if Ls.L then Ls.L:remove(); Ls.L = nil end
+            if Ls.R then Ls.R:remove(); Ls.R = nil end
+            return
+        end
+
+        if not isValid(Ls.L) then Ls.L = l.createProjected() if isValid(Ls.L) then Ls.L:setFarZ(Cfg.FarZ) Ls.L:setTexture(Cfg.Texture) Ls.L:setEnableShadows(Cfg.Shadows) end end
+        if not isValid(Ls.R) then Ls.R = l.createProjected() if isValid(Ls.R) then Ls.R:setFarZ(Cfg.FarZ) Ls.R:setTexture(Cfg.Texture) Ls.R:setEnableShadows(Cfg.Shadows) end end
+
+        local dt = ft()
+        if M ~= Lm then
+            if Lm == 0 and M > 0 then if M == 2 then IsCold = false else IsCold = (ct() - O > Cfg.Cold_Timeout) end end
+            if M == 0 then O = ct() end
+            Lm = M
+        end
+        if M == 2 then IsCold = false end
+        if IsCold and Tp >= 0.99 then IsCold = false end
+
+        local sp = (M == 2 or B > Cfg.Bright_Targets[1]) and Cfg.Flash_Fade_Speed or (IsCold and (Cfg.Light_Tech == "MODERN" and 2 or 8) or Cfg.Warm_Fade_Speed)
+        local step = dt * sp
+        B, F, Tp = MT(B, Cfg.Bright_Targets[M] or 0, step), MT(F, (M == 2) and Cfg.FOV_High or Cfg.FOV_Low, step * 2), MT(Tp, M > 0 and 1 or 0, step * 0.05)
+
+        local ratio = mc(Tp, 0, 1)
+        local threshold = Cfg.Beam_Ignition_Threshold
+        local projB = (not IsCold) and B or (ratio >= threshold and B * ((ratio - threshold) / (1 - threshold)) or 0)
+
+        local baseCol
+        if Cfg.Light_Tech == "SIMPLE" then baseCol = Cfg.Simple.Color_White
+        elseif not IsCold then baseCol = (Cfg.Light_Tech == "MODERN" and Cfg.Modern.Color_Run or Cfg.Classic.Color_Run)
+        elseif Cfg.Light_Tech == "MODERN" then baseCol = lv(ratio, Cfg.Modern.Color_Ignition, Cfg.Modern.Color_Run)
+        else baseCol = lv(ratio, Cfg.Classic.Color_Dim, Cfg.Classic.Color_Run) end
+
+        local cP, rV = ltw(c, V_OFF), c:getRight() * Cfg.Offset_Right
+        local tL, tR = cP + rV, cP - rV
+        local lift = (Cfg.Light_Tech == "MODERN" and M == 2) and Cfg.Modern.High_Beam_Lift or 0
+        local tA = ltwa(c, A(BASE_ANG.p + lift, BASE_ANG.y, BASE_ANG.r))
+
+        if sL == V(0,0,0) then sL, sR, sA = tL, tR, tA end
+        sL, sR, sA = lv(Cfg.Beam_Smoothing, sL, tL), lv(Cfg.Beam_Smoothing, sR, tR), la(Cfg.Beam_Smoothing, sA, tA)
+        local fC = C(baseCol.x, baseCol.y, baseCol.z)
+
+        if isValid(Ls.L) then Ls.L:setPos(sL) Ls.L:setAngles(sA) Ls.L:setBrightness(projB) Ls.L:setFOV(F) Ls.L:setColor(fC) Ls.L:update() end
+        if isValid(Ls.R) then Ls.R:setPos(sR) Ls.R:setAngles(sA) Ls.R:setBrightness(projB) Ls.R:setFOV(F) Ls.R:setColor(fC) Ls.R:update() end
+    end)
+end
