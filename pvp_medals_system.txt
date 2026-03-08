@@ -1,0 +1,820 @@
+--@name PVP Medals System
+--@author Yamachinima
+--@realm shared
+
+--------------------------------------------------------------------------------
+-- 1. CONFIGURATION
+--------------------------------------------------------------------------------
+local CFG = {
+    DebugMode = true, 
+    
+    ImageURL = "https://raw.githubusercontent.com/Yamachinima/newprojects/refs/heads/main/BOIIMedals.png",
+    
+    DisplayTime = 4.0,
+    AnimTime    = 0.5,
+    FadeTime    = 1.0,
+
+    POT_Width   = 1920, 
+    POT_Height  = 1080,
+    
+    Draw_Size_W = 200,
+    Draw_Size_H = 300, 
+    
+    Drop_Offset = -120, 
+
+    Max_Visible   = 6,   
+    Medal_Spacing = 20,  
+    Text_Size     = 36,  
+    Text_Weight   = 800, 
+    Text_Offset_Y = -5,  
+    
+    Rapid_Time    = 4.0, 
+
+    Stats_KeyBind      = 93,
+    Stats_BG_Color     = Color(12, 12, 12, 250),
+    Stats_Header_Color = Color(22, 22, 22, 255),
+    Stats_Border_Color = Color(70, 70, 70, 255),
+    Stats_Text_Color   = Color(255, 255, 255, 255),
+    Stats_Label_Color  = Color(140, 140, 140, 255),
+    Stats_Total_Color  = Color(220, 220, 220, 255),
+    Stats_Panel_W      = 540,
+    Stats_Panel_H      = 650,
+    Stats_Row_H        = 56, 
+    Stats_Header_H     = 85,
+    Stats_Footer_H     = 45,
+    Stats_Pad          = 20,
+    Stats_Font_Size    = 18,
+    Stats_Title_Size   = 28,
+
+    Tiers = {
+        { Kills = 5,  Name = "Bloodthirsty", Desc = "Achieve 5 kills without dying.", Repeat = false, X = 0,    Y = -80, W = 185, H = 185 },
+        { Kills = 10, Name = "Merciless",    Desc = "Achieve 10 kills without dying.", Repeat = false, X = 180,  Y = -80, W = 185, H = 185 },
+        { Kills = 15, Name = "Ruthless",     Desc = "Achieve 15 kills without dying.", Repeat = false, X = 370,  Y = -80, W = 185, H = 185 },
+        { Kills = 20, Name = "Relentless",   Desc = "Achieve 20 kills without dying.", Repeat = false, X = 560,  Y = -80, W = 185, H = 185 },
+        { Kills = 25, Name = "Brutal",       Desc = "Achieve 25 kills without dying.", Repeat = false, X = 750,  Y = -80, W = 185, H = 185 },
+        { Kills = 30, Name = "Nuclear",      Desc = "Achieve 30 kills without dying.", Repeat = false, X = 940,  Y = -80, W = 185, H = 185 },
+        { Kills = 31, Name = "Unstoppable",  Desc = "Achieve 31+ kills without dying.", Repeat = true,  X = 1130, Y = -80, W = 185, H = 185 },
+
+        { Event = "Headshot",        Name = "Headshot",         Desc = "Kill an enemy with a shot to the head.", X = 1315, Y = -80, W = 185, H = 185 },
+        { Event = "Afterlife",       Name = "Afterlife",        Desc = "Kill an enemy after you have died.", X = 1495, Y = -80, W = 185, H = 185 },
+        { Event = "AssistedSuicide", Name = "Assisted Suicide", Desc = "Damage an enemy who then dies to the environment.", X = 1690, Y = -80, W = 185, H = 185 },
+        { Event = "Avenger",         Name = "Avenger",          Desc = "Kill an enemy who recently killed a friend.", X = 0,    Y = 130, W = 185, H = 185 },
+        { Event = "Backstabber",     Name = "Backstabber",      Desc = "Kill an enemy by knifing or throwing a machete in the back.", X = 180,  Y = 130, W = 185, H = 185 },
+        { Event = "Buzzkill",        Name = "Buzzkill",         Desc = "End an enemy's killstreak of 10 or more.", X = 370,  Y = 130, W = 185, H = 185 },
+        { Event = "ChoppedUp",       Name = "ChoppedUp",        Desc = "Kill an enemy using a sword or machete.", X = 560,  Y = 130, W = 185, H = 185 },
+        { Event = "Comeback",        Name = "Comeback",         Desc = "Get a kill after dying 3 or more times consecutively.", X = 750,  Y = 130, W = 185, H = 185 },
+        { Event = "Deadeye",         Name = "Deadeye",          Desc = "Kill an enemy using a precision bow or harpoon.", X = 940,  Y = 130, W = 185, H = 185 },
+        { Event = "Dropshot",        Name = "Dropshot",         Desc = "Kill an enemy while crouching.", X = 1130, Y = 130, W = 185, H = 185 },
+        { Event = "LongShot",        Name = "LongShot",         Desc = "Kill an enemy from a long distance.", X = 1315, Y = 130, W = 185, H = 185 },
+        { Event = "OneShotOneKill",  Name = "OneShotOneKill",   Desc = "Kill a full-health enemy with a single sniper shot.", X = 1505, Y = 130, W = 185, H = 185 },
+        { Event = "Revenge",         Name = "Revenge",          Desc = "Kill the enemy who last killed you.", X = 1690, Y = 130, W = 185, H = 185 },
+        { Event = "Skewered",        Name = "Skewered",         Desc = "Kill an enemy using a knife.", X = 0,    Y = 340, W = 185, H = 185 },
+        { Event = "Stick",           Name = "Stick",            Desc = "Kill an enemy with a sticky explosive.", X = 180,  Y = 340, W = 185, H = 185 },
+        { Event = "Survivor",        Name = "Survivor",         Desc = "Kill an enemy while your health is critically low.", X = 370,  Y = 340, W = 185, H = 185 },
+        { Event = "QuadFeed",        Name = "Quad Feed",        Desc = "Get 4 uninterrupted kills in the killfeed.", X = 560,  Y = 340, W = 185, H = 185 },
+        
+        { Event = "DoubleKill",      Name = "Double Kill",      Desc = "Rapidly kill 2 enemies.", X = 750,  Y = 340, W = 185, H = 185 },
+        { Event = "TripleKill",      Name = "Triple Kill",      Desc = "Rapidly kill 3 enemies.", X = 940,  Y = 340, W = 185, H = 185 },
+        { Event = "FuryKill",        Name = "Fury Kill",        Desc = "Rapidly kill 4 enemies.", X = 1130, Y = 340, W = 185, H = 185 },
+        { Event = "FrenzyKill",      Name = "Frenzy Kill",      Desc = "Rapidly kill 5 enemies.", X = 1315, Y = 340, W = 185, H = 185 },
+        { Event = "SuperKill",       Name = "Super Kill",       Desc = "Rapidly kill 6 enemies.", X = 1505, Y = 340, W = 185, H = 185 },
+        { Event = "MegaKill",        Name = "Mega Kill",        Desc = "Rapidly kill 7 enemies.", X = 1690, Y = 340, W = 185, H = 185 },
+        { Event = "UltraKill",       Name = "Ultra Kill",       Desc = "Rapidly kill 8 enemies.", X = 0,    Y = 550, W = 185, H = 185 },
+        { Event = "KillChain",       Name = "Kill Chain",       Desc = "Rapidly kill more than 8 enemies.", X = 180,  Y = 550, W = 185, H = 185 }
+    }
+}
+
+--------------------------------------------------------------------------------
+-- 2. SERVER LOGIC
+--------------------------------------------------------------------------------
+if SERVER then
+    local currentStreak = 0
+    local deathStreak = 0
+    local ply = owner()
+    local totalKills = 0
+    local totalDeaths = 0
+    
+    local lastKilledByID = -1
+    local quadFeedTracker = {}
+ 
+    local globalStreaks = {} 
+    local victimHistory = {}
+    local lastHitgroups = {}
+    local oneShotEligible = {}
+    local processedCorpses = {}
+    local recentDamager = {}
+    
+    local rapidKills = 0
+    local lastRapidTime = 0
+
+    local EventMedalLookup = {}
+    for i, tier in ipairs(CFG.Tiers) do
+        if tier.Event then EventMedalLookup[tier.Event] = i - 1 end
+    end
+
+    local function checkStreak()
+        local idx = -1
+        for i, tier in ipairs(CFG.Tiers) do
+            if tier.Kills and (currentStreak == tier.Kills or (tier.Repeat and currentStreak >= tier.Kills)) then
+                idx = i - 1
+            end
+        end
+
+        if idx >= 0 then
+            net.start("TriggerMedal")
+            net.writeUInt(idx, 8) 
+            net.send(ply)
+        end
+    end
+
+    local function syncKD()
+        net.start("SyncKD")
+        net.writeUInt(math.min(totalKills, 65535), 16)
+        net.writeUInt(math.min(totalDeaths, 65535), 16)
+        net.send(ply)
+    end
+
+    local function triggerEvent(eventName)
+        local idx = EventMedalLookup[eventName]
+        if idx then
+            net.start("TriggerMedal")
+            net.writeUInt(idx, 8)
+            net.send(ply)
+        end
+    end
+
+    hook.add("EntityRemoved", "CleanupKillstreakData", function(ent)
+        if not isValid(ent) then return end
+        local id = ent:entIndex()
+        globalStreaks[id] = nil
+        victimHistory[id] = nil
+        lastHitgroups[id] = nil
+        oneShotEligible[id] = nil
+        processedCorpses[id] = nil
+        recentDamager[id] = nil
+    end)
+
+    hook.add("scaleplayerdamage", "TrackPlayerHitgroups", function(target, hitgroup, dmginfo)
+        if isValid(target) then lastHitgroups[target:entIndex()] = hitgroup end
+    end)
+
+    local function TagRecentDamager(target, dmginfo)
+        if not isValid(target) or target == ply or not target:isPlayer() then return end
+        
+        local hp = target:getHealth()
+        if hp >= target:getMaxHealth() and hp > 0 then
+            oneShotEligible[target:entIndex()] = timer.curtime()
+        end
+        
+        local tagged = false
+        local ok, att = pcall(function() return dmginfo:getAttacker() end)
+        if ok and isValid(att) then
+            local actualAtt = att
+            if att ~= ply and type(att.getOwner) == "function" and isValid(att:getOwner()) then
+                actualAtt = att:getOwner()
+            end
+            if actualAtt == ply then tagged = true end
+        end
+
+        if not tagged and isValid(ply) then
+            local trace = ply:getEyeTrace()
+            if trace.Entity == target and (ply:keyDown(1) or ply:keyDown(2)) then
+                tagged = true
+            end
+        end
+
+        if tagged then
+            recentDamager[target:entIndex()] = timer.curtime()
+        end
+    end
+    
+    hook.add("EntityTakeDamage", "CoreDamageTracking", TagRecentDamager)
+    hook.add("PostEntityTakeDamage", "BackupDamageTracking", TagRecentDamager)
+    
+    local function checkAssistedSuicide(victim, attacker)
+        if not isValid(victim) then return end
+        local vicID = victim:entIndex()
+        
+        if not recentDamager[vicID] or (timer.curtime() - recentDamager[vicID] > 10) then 
+            recentDamager[vicID] = nil 
+            return 
+        end
+        
+        local isEnvironment = true
+        if isValid(attacker) and attacker:isPlayer() and attacker ~= victim then
+            isEnvironment = false
+        end
+
+        if isEnvironment then triggerEvent("AssistedSuicide") end
+        recentDamager[vicID] = nil 
+    end
+
+    local function evaluateEvents(victim, inflictor, attacker)
+        if not isValid(victim) then return end
+        
+        local vicID = victim:entIndex()
+        local ct = timer.curtime()
+        
+        if processedCorpses[vicID] and processedCorpses[vicID] > ct then return end
+        processedCorpses[vicID] = ct + 1
+
+        local infClass = isValid(inflictor) and inflictor:getClass():lower() or ""
+        local activeWepClass = ""
+        
+        if isValid(attacker) and attacker:isPlayer() and isValid(attacker:getActiveWeapon()) then
+            activeWepClass = attacker:getActiveWeapon():getClass():lower()
+        end
+        
+        local combinedWepStr = infClass .. " " .. activeWepClass
+        local isSpecialty = isValid(inflictor) and not inflictor:isPlayer() and not inflictor:isWeapon()
+
+        currentStreak = currentStreak + 1
+        totalKills = totalKills + 1
+        checkStreak()
+        syncKD()
+
+        if ct - lastRapidTime <= CFG.Rapid_Time then
+            rapidKills = rapidKills + 1
+        else
+            rapidKills = 1
+        end
+        lastRapidTime = ct
+
+        if rapidKills == 2 then triggerEvent("DoubleKill")
+        elseif rapidKills == 3 then triggerEvent("TripleKill")
+        elseif rapidKills == 4 then triggerEvent("FuryKill")
+        elseif rapidKills == 5 then triggerEvent("FrenzyKill")
+        elseif rapidKills == 6 then triggerEvent("SuperKill")
+        elseif rapidKills == 7 then triggerEvent("MegaKill")
+        elseif rapidKills == 8 then triggerEvent("UltraKill")
+        elseif rapidKills > 8 then triggerEvent("KillChain")
+        end
+
+        if victim:lastHitGroup() == 1 or lastHitgroups[vicID] == 1 then
+            triggerEvent("Headshot")
+        end
+        
+        if not ply:isAlive() then triggerEvent("Afterlife") end
+        
+        local lastTarget = victimHistory[vicID]
+        if isValid(lastTarget) and lastTarget.getFriendStatus and lastTarget:getFriendStatus() == "friend" then
+            triggerEvent("Avenger")
+        end
+        
+        if combinedWepStr:find("knife") then
+            triggerEvent("Skewered")
+            local plyAim = ply:getEyeAngles():getForward()
+            local vicAim = (victim.getEyeAngles and victim:getEyeAngles():getForward()) or victim:getAngles():getForward()
+            if plyAim:dot(vicAim) > 0.5 then triggerEvent("Backstabber") end
+        end
+        
+        if globalStreaks[vicID] and globalStreaks[vicID] >= 10 then triggerEvent("Buzzkill") end
+        if combinedWepStr:find("damascus") or combinedWepStr:find("machete") then triggerEvent("ChoppedUp") end
+        if deathStreak >= 3 then triggerEvent("Comeback") end
+        if combinedWepStr:find("harpoon") or combinedWepStr:find("bolt") or combinedWepStr:find("crossbow") then triggerEvent("Deadeye") end
+        if ply:isCrouching() and not isSpecialty then triggerEvent("Dropshot") end
+        if ply:getPos():getDistance(victim:getPos()) > 4000 and not isSpecialty then triggerEvent("LongShot") end
+        
+        -- Fixed: Use iterative search as Lua does not support Regex OR patterns
+        local isSniper = false
+        local sniperTags = {"sniper", "awp", "barret", "intervention", "m98b", "m24", "psg1", "svt", "dragunov", "ballista", "dsr", "scout", "l96", "wa2000"}
+        
+        for i = 1, #sniperTags do
+            if combinedWepStr:find(sniperTags[i]) then
+                isSniper = true
+                break
+            end
+        end
+        
+        -- Increased window to 0.2s to handle server tick variance/jitter
+        local isOneShot = oneShotEligible[vicID] and (ct - oneShotEligible[vicID]) <= 0.2
+        
+        if isSniper and isOneShot and not isSpecialty then 
+            triggerEvent("OneShotOneKill") 
+        end
+
+        if lastKilledByID == vicID then 
+            triggerEvent("Revenge") 
+            lastKilledByID = -1 
+        end
+ 
+        if combinedWepStr:find("sticky") then triggerEvent("Stick") end
+        
+        if ply:isAlive() and ply:getHealth() > 0 and ply:getHealth() <= (ply:getMaxHealth() * 0.2) then triggerEvent("Survivor") end
+        
+        table.insert(quadFeedTracker, ct)
+        for i = #quadFeedTracker, 1, -1 do
+            if ct - quadFeedTracker[i] > 5 then table.remove(quadFeedTracker, i) end
+        end
+        
+        if #quadFeedTracker >= 4 then
+            triggerEvent("QuadFeed")
+            quadFeedTracker = {} 
+        end
+
+        deathStreak = 0 
+        globalStreaks[vicID] = 0 
+        lastHitgroups[vicID] = 0
+        oneShotEligible[vicID] = nil
+        recentDamager[vicID] = nil
+    end
+
+    hook.add("PlayerDeath", "TrackPlayerKills", function(victim, inflictor, attacker)
+        local isValidAttacker = isValid(attacker)
+        local isPlayerAttacker = isValidAttacker and attacker:isPlayer()
+        local attID = isValidAttacker and attacker:entIndex() or -1
+
+        if isPlayerAttacker and attacker ~= victim then
+            globalStreaks[attID] = (globalStreaks[attID] or 0) + 1
+            victimHistory[attID] = victim
+        end
+
+        if attacker ~= ply then
+            quadFeedTracker = {} 
+        end
+
+        if victim == ply then
+            currentStreak = 0 
+            deathStreak = deathStreak + 1
+            totalDeaths = totalDeaths + 1
+            lastKilledByID = attID
+            globalStreaks[ply:entIndex()] = 0
+            syncKD()
+        elseif attacker == ply and victim ~= ply then
+            evaluateEvents(victim, inflictor, attacker)
+        else
+            checkAssistedSuicide(victim, attacker)
+        end
+    end)
+
+--------------------------------------------------------------------------------
+-- 3. CLIENT LOGIC
+--------------------------------------------------------------------------------
+else
+    local isOwner = player() == owner()
+
+    if isOwner then 
+        enableHud(nil, true) 
+    end
+
+    local activeMedals = {}
+    local medalFont  = render.createFont("Roboto", CFG.Text_Size, CFG.Text_Weight, true)
+    local statsFont  = render.createFont("Roboto", CFG.Stats_Font_Size, 600, true)
+    local titleFont  = render.createFont("Roboto", CFG.Stats_Title_Size, 800, true)
+    local smallFont  = render.createFont("Roboto", 16, 700, true)
+    local kdFont     = render.createFont("Roboto", 18, 600, true)
+
+    local streakMat = material.create("UnlitGeneric")
+    streakMat:setInt("$translucent", 1)
+    streakMat:setInt("$vertexalpha", 1) 
+    streakMat:setInt("$vertexcolor", 1) 
+    streakMat:setTextureURL("$basetexture", CFG.ImageURL)
+
+    local STATS_FILE = "killstreak_stats.txt"
+    local medalStats = {}
+    local lifetimeStats = { kills = 0, deaths = 0 }
+
+    local function initStats()
+        for i = 1, #CFG.Tiers do
+            if medalStats[i - 1] == nil then medalStats[i - 1] = 0 end
+        end
+    end
+
+    local function saveStats()
+        if not isOwner then return end
+        local lines = {}
+        for id, count in pairs(medalStats) do
+            lines[#lines + 1] = tostring(id) .. "=" .. tostring(count)
+        end
+        lines[#lines + 1] = "LK=" .. tostring(lifetimeStats.kills)
+        lines[#lines + 1] = "LD=" .. tostring(lifetimeStats.deaths)
+        file.write(STATS_FILE, table.concat(lines, "\n"))
+    end
+
+    local function loadStats()
+        if not isOwner then return end
+        if file.exists(STATS_FILE) then
+            local raw = file.read(STATS_FILE)
+            if raw then
+                for line in raw:gmatch("[^\n]+") do
+                    local id, count = line:match("^(-?%d+)=(%d+)$")
+                    if id and count then
+                        medalStats[tonumber(id)] = tonumber(count)
+                    else
+                        local lk = line:match("^LK=(%d+)$")
+                        if lk then lifetimeStats.kills = tonumber(lk) end
+                        local ld = line:match("^LD=(%d+)$")
+                        if ld then lifetimeStats.deaths = tonumber(ld) end
+                    end
+                end
+            end
+        end
+        initStats()
+    end
+
+    loadStats()
+
+    local MEDAL_LIST = {}
+    for i, tier in ipairs(CFG.Tiers) do
+        MEDAL_LIST[#MEDAL_LIST + 1] = { id = i - 1, name = tier.Name }
+    end
+
+    local UI = {
+        open         = false,
+        scroll       = 0,
+        maxScroll    = 0,
+        dragging     = false,
+        dragStartY   = 0,
+        dragStartScroll = 0,
+        selectedMedal = nil,
+        descBox      = nil
+    }
+
+    local kdStats = { kills = 0, deaths = 0 }
+
+    net.receive("SyncKD", function()
+        local newKills = net.readUInt(16)
+        local newDeaths = net.readUInt(16)
+        
+        local dKills = newKills - kdStats.kills
+        local dDeaths = newDeaths - kdStats.deaths
+        
+        if dKills > 0 then lifetimeStats.kills = lifetimeStats.kills + dKills end
+        if dDeaths > 0 then lifetimeStats.deaths = lifetimeStats.deaths + dDeaths end
+        
+        kdStats.kills = newKills
+        kdStats.deaths = newDeaths
+        saveStats()
+    end)
+
+    local function getPanelGeom(sw, sh)
+        local pw = CFG.Stats_Panel_W
+        local ph = CFG.Stats_Panel_H
+        local px = math.floor((sw - pw) / 2)
+        local py = math.floor((sh - ph) / 2)
+        local hh  = CFG.Stats_Header_H
+        local fh  = CFG.Stats_Footer_H
+        local colH = 28
+        local rowStartY = py + hh + colH
+        local rowEndY   = py + ph - fh
+        local listAreaH = rowEndY - rowStartY
+        return pw, ph, px, py, hh, fh, colH, rowStartY, rowEndY, listAreaH
+    end
+
+    local function hit(rx, ry, rw, rh, mx, my)
+        return mx >= rx and mx <= rx + rw and my >= ry and my <= ry + rh
+    end
+
+    local function openPanel()
+        if not isOwner then return end
+        UI.open         = true
+        UI.scroll       = 0
+        UI.dragging     = false
+        UI.selectedMedal = nil
+        input.enableCursor(true)
+    end
+
+    local function closePanel()
+        if not isOwner then return end
+        UI.open         = false
+        UI.dragging     = false
+        UI.selectedMedal = nil
+        input.enableCursor(false)
+    end
+
+    hook.add("inputPressed", "UIInput", function(k)
+        if not isOwner then return end
+
+        if k == CFG.Stats_KeyBind then
+            if not UI.open then openPanel() else closePanel() end
+            return
+        end
+
+        if not UI.open then return end
+
+        local sw, sh = render.getGameResolution()
+        local pw, ph, px, py, hh, fh, colH, rowStartY, rowEndY, listAreaH = getPanelGeom(sw, sh)
+
+        if k == 201 then
+            UI.scroll = math.max(0, UI.scroll - (CFG.Stats_Row_H * 1.5))
+            return
+        end
+        if k == 202 then
+            UI.scroll = math.min(UI.maxScroll, UI.scroll + (CFG.Stats_Row_H * 1.5))
+            return
+        end
+
+        if k == 107 then
+            local mx, my = input.getCursorPos()
+
+            if UI.closeBtnX and hit(UI.closeBtnX, UI.closeBtnY, UI.closeBtnW, UI.closeBtnH, mx, my) then
+                closePanel()
+                return
+            end
+
+            local trackX = px + pw - 10
+            local trackW = 8
+            local trackY = rowStartY
+            local trackH = rowEndY - rowStartY
+
+            if UI.maxScroll > 0 and hit(trackX, trackY, trackW, trackH, mx, my) then
+                UI.dragging       = true
+                UI.dragStartY     = my
+                UI.dragStartScroll = UI.scroll
+                return
+            end
+            
+            if UI.descBox and hit(UI.descBox.x, UI.descBox.y, UI.descBox.w, UI.descBox.h, mx, my) then
+                UI.selectedMedal = nil
+                return
+            end
+
+            for idx, entry in ipairs(MEDAL_LIST) do
+                local rowY = rowStartY + (idx - 1) * CFG.Stats_Row_H - UI.scroll
+                if rowY + CFG.Stats_Row_H > rowStartY and rowY < rowEndY then
+                    if hit(px, rowY, pw, CFG.Stats_Row_H, mx, my) then
+                        if UI.selectedMedal == entry.id then
+                            UI.selectedMedal = nil
+                        else
+                            UI.selectedMedal = entry.id
+                        end
+                        return
+                    end
+                end
+            end
+        end
+    end)
+
+    hook.add("inputReleased", "UIInputRelease", function(k)
+        if not isOwner then return end
+        if k == 107 then UI.dragging = false end
+    end)
+
+    hook.add("think", "UIScrollDrag", function()
+        if not isOwner or not UI.open or not UI.dragging then return end
+
+        local sw, sh = render.getGameResolution()
+        local pw, ph, px, py, hh, fh, colH, rowStartY, rowEndY, listAreaH = getPanelGeom(sw, sh)
+        local trackH = rowEndY - rowStartY
+        local totalRowH = #MEDAL_LIST * CFG.Stats_Row_H
+        local thumbH    = math.max(30, trackH * (listAreaH / math.max(totalRowH, 1)))
+        local scrollRange = trackH - thumbH
+
+        if scrollRange <= 0 then return end
+
+        local _, my = input.getCursorPos()
+        local delta = my - UI.dragStartY
+        local scrollDelta = (delta / scrollRange) * UI.maxScroll
+        UI.scroll = math.max(0, math.min(UI.maxScroll, UI.dragStartScroll + scrollDelta))
+    end)
+
+    net.receive("TriggerMedal", function(len)
+        local medalID = net.readUInt(8)
+        local ct = timer.curtime()
+        local found = false
+        
+        for i, medal in ipairs(activeMedals) do
+            if medal.id == medalID then
+                medal.startTime = ct
+                medal.endTime = ct + CFG.DisplayTime
+                medal.multiplier = (medal.multiplier or 1) + 1
+                local stackedMedal = table.remove(activeMedals, i)
+                table.insert(activeMedals, stackedMedal)
+                found = true
+                break
+            end
+        end
+        
+        if not found then
+            table.insert(activeMedals, { id = medalID, startTime = ct, endTime = ct + CFG.DisplayTime, multiplier = 1 })
+            -- Clean out oldest if we exceed max visibility. Iterate backwards to prevent index shifting bugs during removal.
+            while #activeMedals > CFG.Max_Visible do
+                table.remove(activeMedals, 1)
+            end
+        end
+
+        medalStats[medalID] = (medalStats[medalID] or 0) + 1
+        saveStats()
+
+        local medalName = CFG.Tiers[medalID + 1] and CFG.Tiers[medalID + 1].Name or "UNKNOWN"
+        print(Color(255, 50, 50), "[Streak] ", Color(255, 255, 255), "Medal Achieved: ", Color(255, 200, 0), medalName)
+    end)
+
+    local function drawStatsPanel(sw, sh)
+        local pw, ph, px, py, hh, fh, colH, rowStartY, rowEndY, listAreaH = getPanelGeom(sw, sh)
+        local pad = CFG.Stats_Pad
+        local rh  = CFG.Stats_Row_H
+
+        local totalRowH  = #MEDAL_LIST * rh
+        UI.maxScroll     = math.max(0, totalRowH - listAreaH)
+        UI.scroll        = math.min(UI.scroll, UI.maxScroll)
+
+        local totalMedals = 0
+        for _, entry in ipairs(MEDAL_LIST) do
+            totalMedals = totalMedals + (medalStats[entry.id] or 0)
+        end
+
+        local lifeKD = lifetimeStats.deaths > 0 and (math.floor((lifetimeStats.kills / lifetimeStats.deaths) * 100) / 100) or lifetimeStats.kills
+        local mx, my = input.getCursorPos()
+
+        render.setColor(CFG.Stats_BG_Color)
+        render.drawRect(px, py, pw, ph)
+
+        for idx, entry in ipairs(MEDAL_LIST) do
+            local rowY = rowStartY + (idx - 1) * rh - UI.scroll
+
+            if rowY + rh > rowStartY and rowY < rowEndY then
+                local count = medalStats[entry.id] or 0
+                local isUnlocked = count > 0
+                local isHovered = hit(px, rowY, pw, rh, mx, my)
+
+                if isUnlocked or isHovered then
+                    local alpha = isHovered and 15 or 5
+                    render.setColor(Color(255, 255, 255, alpha))
+                    render.drawRect(px, rowY, pw, rh)
+                end
+
+                if isUnlocked then
+                    local tierData = CFG.Tiers[entry.id + 1]
+                    if tierData then
+                        local iconW, iconH = 64, 94 
+                        local u1, v1 = tierData.X / CFG.POT_Width, tierData.Y / CFG.POT_Height
+                        local u2, v2 = (tierData.X + tierData.W) / CFG.POT_Width, (tierData.Y + tierData.H) / CFG.POT_Height
+                        local drawY = rowY + (rh - iconH) / -40 - 40
+                        
+                        render.setMaterial(streakMat)
+                        render.setColor(Color(255, 255, 255, 255))
+                        render.drawTexturedRectUV(px + pad- 5, drawY, iconW, iconH, u1, v1, u2, v2)
+                    end
+                end
+
+                local textOffsetX = isUnlocked and (pad + 80) or pad
+                
+                render.setFont(statsFont)
+                render.setColor(isUnlocked and Color(255, 255, 255, 255) or Color(60, 60, 60, 255))
+                render.drawSimpleText(px + textOffsetX, rowY + rh / 2, entry.name, 0, 1)
+
+                if isUnlocked then
+                    render.drawSimpleText(px + pw - pad - 24, rowY + rh / 2, tostring(count), 2, 1)
+                else
+                    render.setFont(smallFont)
+                    render.setColor(Color(40, 40, 40, 255))
+                    render.drawSimpleText(px + pw - pad - 24, rowY + rh / 2, "-", 2, 1)
+                end
+
+                render.setColor(Color(255, 255, 255, 4))
+                render.drawRect(px, rowY + rh - 1, pw, 1)
+            end
+        end
+
+        render.setColor(CFG.Stats_Header_Color)
+        render.drawRect(px, py, pw, hh)
+        render.setColor(CFG.Stats_Border_Color)
+        render.drawRect(px, py + hh - 1, pw, 1)
+        render.setFont(titleFont)
+        render.setColor(CFG.Stats_Text_Color)
+        render.drawSimpleText(px + pad, py + 18, "COMBAT RECORD", 0, 0)
+
+        local kdStr = string.format("SESSION K: %d   |   D: %d   |   LIFETIME RATIO: %.2f", kdStats.kills, kdStats.deaths, lifeKD)
+        render.setFont(kdFont)
+        render.setColor(CFG.Stats_Label_Color)
+        render.drawSimpleText(px + pad, py + hh - 26, kdStr, 0, 0)
+
+        local btnW, btnH = 24, 24
+        local btnX, btnY = px + pw - pad - btnW, py + 18
+        UI.closeBtnX, UI.closeBtnY, UI.closeBtnW, UI.closeBtnH = btnX, btnY, btnW, btnH
+
+        local hoveringClose = hit(btnX, btnY, btnW, btnH, mx, my)
+        render.setColor(hoveringClose and Color(200, 40, 40, 255) or Color(30, 30, 30, 255))
+        render.drawRect(btnX, btnY, btnW, btnH)
+        render.setColor(Color(80, 80, 80, 255))
+        render.drawRectOutline(btnX, btnY, btnW, btnH, 1)
+        render.setColor(Color(255, 255, 255, 255))
+        render.setFont(statsFont)
+        render.drawSimpleText(btnX + btnW / 2, btnY + btnH / 2, "X", 1, 1)
+
+        local colY = py + hh
+        render.setColor(Color(8, 8, 8, 255))
+        render.drawRect(px, colY, pw, colH)
+        render.setColor(Color(40, 40, 40, 255))
+        render.drawRect(px, colY + colH - 1, pw, 1)
+        render.setFont(smallFont)
+        render.setColor(Color(100, 100, 100, 255))
+        render.drawSimpleText(px + pad, colY + colH / 2, "MEDAL DESIGNATION", 0, 1)
+        render.drawSimpleText(px + pw - pad - 24, colY + colH / 2, "ACQUIRED", 2, 1)
+
+        render.setColor(CFG.Stats_Header_Color)
+        render.drawRect(px, rowEndY, pw, fh)
+        render.setColor(CFG.Stats_Border_Color)
+        render.drawRect(px, rowEndY, pw, 1)
+        render.setFont(statsFont)
+        render.setColor(CFG.Stats_Label_Color)
+        render.drawSimpleText(px + pad, rowEndY + fh / 2, "LIFETIME MEDALS", 0, 1)
+        render.setFont(titleFont)
+        render.setColor(Color(255, 215, 0, 255)) 
+        render.drawSimpleText(px + pw - pad - 24, rowEndY + fh / 2, tostring(totalMedals), 2, 1)
+
+        render.setColor(Color(60, 60, 60, 255))
+        render.drawRectOutline(px, py, pw, ph, 1)
+        render.setColor(Color(10, 10, 10, 255))
+        render.drawRectOutline(px - 1, py - 1, pw + 2, ph + 2, 1)
+
+        if UI.maxScroll > 0 then
+            local trackX, trackW = px + pw - 12, 4
+            local trackY, trackH = rowStartY + 4, rowEndY - rowStartY - 8
+            local thumbH = math.max(30, trackH * (listAreaH / math.max(totalRowH, 1)))
+            local thumbY = trackY + (UI.scroll / UI.maxScroll) * (trackH - thumbH)
+
+            render.setColor(Color(20, 20, 20, 255))
+            render.drawRect(trackX, trackY, trackW, trackH)
+            render.setColor(UI.dragging and Color(200, 200, 200, 255) or Color(100, 100, 100, 255))
+            render.drawRect(trackX, thumbY, trackW, thumbH)
+        end
+
+        -- Draw the floating description box last so it overlays the rows
+        if UI.selectedMedal then
+            local selectedIdx = 0
+            for i, v in ipairs(MEDAL_LIST) do if v.id == UI.selectedMedal then selectedIdx = i break end end
+            local descRowY = rowStartY + (selectedIdx - 1) * rh - UI.scroll
+            
+            if descRowY + rh > rowStartY and descRowY < rowEndY then
+                local descStr = CFG.Tiers[UI.selectedMedal + 1].Desc or "No description available."
+                local boxW, boxH = pw - (pad * 2) - 16, 40
+                local boxX, boxY = px + pad, descRowY + rh
+                
+                -- Clamp box inside the panel if near bottom
+                if boxY + boxH > rowEndY then boxY = descRowY - boxH end
+                
+                UI.descBox = {x = boxX, y = boxY, w = boxW, h = boxH}
+                
+                render.setColor(Color(18, 18, 18, 250))
+                render.drawRect(boxX, boxY, boxW, boxH)
+                render.setColor(Color(100, 150, 255, 100))
+                render.drawRectOutline(boxX, boxY, boxW, boxH, 1)
+                
+                render.setFont(smallFont)
+                render.setColor(Color(220, 220, 220, 255))
+                render.drawSimpleText(boxX + 10, boxY + boxH / 2, descStr, 0, 1)
+            else
+                UI.descBox = nil
+            end
+        else
+            UI.descBox = nil
+        end
+
+        render.setColor(Color(255, 255, 255, 220))
+        render.drawRect(mx - 1, my - 1, 3, 3)
+    end
+
+    hook.add("drawhud", "DrawKillMedal", function()
+        local ct, ft = timer.curtime(), timer.frametime()
+        local sw, sh = render.getGameResolution()
+        
+        for i = #activeMedals, 1, -1 do
+            if ct > activeMedals[i].endTime then table.remove(activeMedals, i) end
+        end
+        
+        local count = #activeMedals
+        if count > 0 then
+            local w, h = CFG.Draw_Size_W, CFG.Draw_Size_H
+            local totalWidth = (count * w) + ((count - 1) * CFG.Medal_Spacing)
+            local startX = (sw / 2) - (totalWidth / 2)
+            
+            for i, medal in ipairs(activeMedals) do
+                local tierData = CFG.Tiers[medal.id + 1]
+                if not tierData then continue end
+                
+                local u1, v1 = tierData.X / CFG.POT_Width, tierData.Y / CFG.POT_Height
+                local u2, v2 = (tierData.X + tierData.W) / CFG.POT_Width, (tierData.Y + tierData.H) / CFG.POT_Height
+                
+                local timeSinceStart, timeUntilEnd = ct - medal.startTime, medal.endTime - ct
+                local targetY, startY, currentY, alpha = CFG.Drop_Offset, -h, CFG.Drop_Offset, 255
+              
+                if timeSinceStart < CFG.AnimTime then
+                    local fraction = timeSinceStart / CFG.AnimTime
+                    currentY = startY + (targetY - startY) * (fraction * (2 - fraction))
+                end
+                
+                if timeUntilEnd < CFG.FadeTime then alpha = 255 * (timeUntilEnd / CFG.FadeTime) end
+                
+                local targetX = startX + ((i - 1) * (w + CFG.Medal_Spacing))
+                if not medal.currentX then medal.currentX = targetX end
+                medal.currentX = medal.currentX + (targetX - medal.currentX) * 15 * ft
+                
+                local renderColor = Color(255, 255, 255, math.floor(alpha))
+                render.setColor(renderColor)
+                render.setMaterial(streakMat)
+                render.drawTexturedRectUV(medal.currentX, currentY, w, h, u1, v1, u2, v2)
+                
+                local displayText = tierData.Name
+                if medal.multiplier > 1 then displayText = displayText .. " x" .. medal.multiplier end
+                
+                render.setFont(medalFont)
+                render.setColor(renderColor)
+                render.drawSimpleText(medal.currentX + (w / 2), currentY + h + CFG.Text_Offset_Y, displayText, 1, 0)
+            end
+        end
+
+        if UI.open then drawStatsPanel(sw, sh) end
+    end)
+end
