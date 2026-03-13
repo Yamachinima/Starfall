@@ -1,0 +1,290 @@
+--@name Mesher Starfall
+--@author Yamachinima
+--@shared
+
+--------------------------------------------------------------------------------
+-- SETTINGS
+--------------------------------------------------------------------------------
+local SETTINGS = {
+    MODEL_URL    = "https://raw.githubusercontent.com/VitaliaProg/ModelsTextrues/main/Sabre.obj",
+    
+    GLOBAL = {
+        SCALE       = 0.5,             
+        Z_OFFSET    = 0,               
+        ROTATION    = Angle(0, 0, 0), 
+        RENDER_DIST = 4000,
+        MAX_LOAD    = 0.5,             
+        MIN_LOAD    = 0.1,
+        SMOOTH      = true             
+    },
+
+    PARTS = {
+        { 
+            name = "body2", 
+            tex  = "https://raw.githubusercontent.com/VitaliaProg/ModelsTextrues/main/SabreBodydiffuse.jpg", 
+            bump = "",                 
+            flag = 256, 
+            chrome = 1.4, 
+            phong  = { boost = 4, exponent = 30 },
+            doublefaced = false,
+            col = Color(255, 255, 255),
+            trans = 255,
+            override = {},
+            uv_scroll = {u = 0, v = 0}
+        },
+        { 
+            name = "body1", 
+            tex  = "https://raw.githubusercontent.com/VitaliaProg/ModelsTextrues/main/SabreFramediffuse.jpg", 
+            bump = "", 
+            flag = 256, 
+            chrome = 1.4, 
+            phong  = { boost = 4, exponent = 30 },
+            doublefaced = false,
+            col = Color(255, 255, 255),
+            trans = 255,
+            override = {},
+            uv_scroll = {u = 0, v = 0}
+        },
+        { 
+            name = "interior", 
+            tex  = "https://raw.githubusercontent.com/VitaliaProg/ModelsTextrues/main/SabreInteriordiffuse.jpg", 
+            bump = "", 
+            flag = 0,
+            chrome = 0.1,
+            phong  = { boost = 1, exponent = 10 },
+            doublefaced = false,
+            col = Color(255, 255, 255),
+            trans = 255,
+            override = {},
+            uv_scroll = {u = 0, v = 0}
+        },
+        { 
+            name = "window", 
+            tex  = "https://raw.githubusercontent.com/VitaliaProg/ModelsTextrues/main/SabreInteriordiffuse.jpg", 
+            bump = "",
+            flag = 0,
+            chrome = 1.4, 
+            phong  = { boost = 4, exponent = 30 },
+            doublefaced = true,
+            col = Color(155, 155, 155),
+            trans = 120,
+            override = { mat = "sprops/textures/sprops_chrome2", col = Color(155, 155, 155), trans = 100 },
+            uv_scroll = {u = 0.5, v = 0} 
+        }
+    }
+}
+
+--------------------------------------------------------------------------------
+-- CORE ENGINE
+--------------------------------------------------------------------------------
+
+local function formatName(s) return string.gsub(string.gsub(s or "", "^%l", string.upper), "[%p%c%s]", "") end
+
+if SERVER then
+    local EntLinks, Names, Types = {}, {}, {}
+    local Chip = chip()
+    for i, p in ipairs(SETTINGS.PARTS) do
+        local key = formatName(p.name)
+        Names[i], Types[i], EntLinks[key] = key, "entity", Chip
+    end
+    
+    local scrollIndex = #Names + 1
+    Names[scrollIndex] = "Scroll_Active"
+    Types[scrollIndex] = "normal"
+    
+    wire.adjustInputs(Names, Types)
+   
+    local function sync() 
+        net.start("MeshSync") 
+        net.writeTable(EntLinks) 
+        net.send() 
+    end
+    
+    local lastScrollState = false
+    hook.add("Input", "WireInputSync", function(k, v)
+        if k == "Scroll_Active" then
+            local newState = v > 0
+            if newState ~= lastScrollState then
+                lastScrollState = newState
+                net.start("MeshScrollSync")
+                net.writeBool(newState)
+                net.send()
+            end
+            return
+        end
+
+        local t = (isValid(v) and v:isValid()) and v or Chip
+        if EntLinks[k] ~= t then 
+            EntLinks[k] = t 
+            sync() 
+        end
+    end)
+    
+    timer.simple(1, sync)
+else
+    local Chip, LocalPlayer = chip(), player()
+    local Holos, PartMap, IsVisible, ParentCache = {}, {}, true, {}
+    local MaterialCache, ScrollingMats = {}, {}
+    local SCALE_VEC, OFFSET_VEC = Vector(SETTINGS.GLOBAL.SCALE), Vector(0, 0, SETTINGS.GLOBAL.Z_OFFSET)
+    local ScrollActive = false
+    local uvVec = Vector(0, 0, 0)
+    
+    _G.VitaliaMeshCache = _G.VitaliaMeshCache or {}
+
+    local function updateScrollHook()
+        if IsVisible and ScrollActive and #ScrollingMats > 0 then
+            hook.add("Think", "MeshLogicLoop", function()
+                local t = timer.curtime()
+                for i = 1, #ScrollingMats do
+                    local data = ScrollingMats[i]
+                    uvVec[1] = t * data.u
+                    uvVec[2] = t * data.v
+                    data.matrix:setTranslation(uvVec)
+                    data.mat:setMatrix("$basetexturetransform", data.matrix)
+                end
+            end)
+        else
+            hook.remove("Think", "MeshLogicLoop")
+        end
+    end
+
+    local function getMat(p)
+        if MaterialCache[p.name] then return MaterialCache[p.name] end
+        local mat = material.create("VertexLitGeneric")
+        mat:setTextureURL("$basetexture", p.tex, function(s, _, w, h, l) if s then l(0,0,w,h) end end)
+        
+        if p.col then mat:setVector("$color2", Vector(p.col.r/255, p.col.g/255, p.col.b/255)) end
+        if p.trans and p.trans < 255 then
+            mat:setInt("$translucent", 1)
+            mat:setFloat("$alpha", p.trans / 255)
+        end
+        if p.bump and p.bump ~= "" then
+            mat:setTextureURL("$bumpmap", p.bump, function(s, _, w, h, l) if s then l(0,0,w,h) end end)
+        end
+        if p.chrome and p.chrome > 0 then
+            mat:setTexture("$envmap", "env_cubemap")
+            mat:setVector("$envmaptint", Vector(p.chrome, p.chrome, p.chrome))
+            mat:setInt("$envmapfresnel", 1)
+            mat:setInt("$phong", 1)
+            mat:setFloat("$phongboost", p.phong and p.phong.boost or 4)
+            mat:setFloat("$phongexponent", p.phong and p.phong.exponent or 30)
+        end
+        if p.doublefaced then mat:setInt("$nocull", 1) end
+        if p.flag and p.flag > 0 then mat:setInt("$flags", p.flag) end
+    
+        MaterialCache[p.name] = mat
+        if p.uv_scroll and (p.uv_scroll.u ~= 0 or p.uv_scroll.v ~= 0) then
+            table.insert(ScrollingMats, {
+                mat = mat, 
+                u = p.uv_scroll.u, 
+                v = p.uv_scroll.v,
+                matrix = Matrix() 
+            })
+        end
+        
+        return mat
+    end
+
+    local function build(mD)
+        for _, p in ipairs(SETTINGS.PARTS) do
+            local h = holograms.create(Chip:getPos(), SETTINGS.GLOBAL.ROTATION, "models/hunter/blocks/cube025x025x025.mdl", SCALE_VEC)
+            h:setParent(Chip)
+            local fn = formatName(p.name)
+            Holos[p.name], PartMap[fn] = h, p.name
+            if mD[p.name] then
+                h:setMesh(mD[p.name])
+                h:setMeshMaterial(getMat(p))
+                h:setRenderBounds(Vector(-16000), Vector(16000))
+                
+                if p.override and next(p.override) then
+                    if p.override.mat then h:setMaterial(p.override.mat) end
+                    if p.override.col then 
+                        local c = p.override.col
+                        h:setColor(Color(c.r, c.g, c.b, p.override.trans or c.a)) 
+                    end
+                end
+                
+                if (p.override and p.override.trans and p.override.trans < 255) or (p.trans and p.trans < 255) then
+                    h:setRenderMode(1) 
+                end
+                
+                if ParentCache[fn] then
+                    local par = (isValid(ParentCache[fn]) and ParentCache[fn] ~= Chip) and ParentCache[fn] or Chip
+                    h:setParent(par) h:setLocalPos(OFFSET_VEC) h:setLocalAngles(SETTINGS.GLOBAL.ROTATION)
+                end
+            end
+        end
+        
+        local renderDistSqr = SETTINGS.GLOBAL.RENDER_DIST * SETTINGS.GLOBAL.RENDER_DIST
+        
+        timer.create("MeshVisibilityLoop", 0.25, 0, function()
+            if not isValid(Chip) then return end
+            
+            local distSqr = LocalPlayer:getPos():getDistanceSqr(Chip:getPos())
+            local shouldDraw = distSqr <= renderDistSqr
+            
+            if IsVisible ~= shouldDraw then
+                IsVisible = shouldDraw
+                for _, h in pairs(Holos) do
+                    if isValid(h) then h:setNoDraw(not IsVisible) end
+                end
+                updateScrollHook()
+            end
+        end)
+        
+        updateScrollHook()
+    end
+
+    net.receive("MeshSync", function()
+        ParentCache = net.readTable()
+        for k, e in pairs(ParentCache) do
+            local n = PartMap[k]
+            if Holos[n] then
+                local p = (isValid(e) and e ~= Chip) and e or Chip
+                Holos[n]:setParent(p) Holos[n]:setLocalPos(OFFSET_VEC) Holos[n]:setLocalAngles(SETTINGS.GLOBAL.ROTATION)
+            end
+        end
+    end)
+    
+    net.receive("MeshScrollSync", function()
+        ScrollActive = net.readBool()
+        updateScrollHook()
+    end)
+
+    local function handleData(d)
+        if not d or d == "" then return end
+        local co = coroutine.wrap(function() 
+            return mesh.createFromObj(d, SETTINGS.GLOBAL.SMOOTH, true) 
+        end)
+        local q_target = SETTINGS.GLOBAL.MAX_LOAD
+        hook.add("think", "L", function()
+            while quotaUsed() < quotaMax() * q_target do
+                local r = co()
+                if r then
+                    hook.remove("think", "L")
+                    
+                    timer.simple(0, function()
+                        _G.VitaliaMeshCache[SETTINGS.MODEL_URL] = r
+                        build(r)
+                        
+                        d = nil
+                        co = nil
+                        r = nil
+                    end)
+                    
+                    return
+                end
+            end
+        end)
+    end
+
+    if _G.VitaliaMeshCache[SETTINGS.MODEL_URL] then
+        build(_G.VitaliaMeshCache[SETTINGS.MODEL_URL])
+    else
+        http.get(SETTINGS.MODEL_URL, function(d)
+            if d and d ~= "" then
+                handleData(d)
+            end
+        end)
+    end
+end
