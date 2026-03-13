@@ -1,0 +1,536 @@
+--@name Winamp Music Player
+--@author Yamachinima
+--@realm shared
+
+local YAMA_CFG = {
+    UI_Width = 600,
+    UI_Height = 420,
+    UI_KeyBind = 93, 
+    MOUSE_LEFT = 107,
+    
+    Colors = {
+        BG = Color(10, 10, 12, 250),
+        Header = Color(5, 5, 5, 255),
+        Panel = Color(15, 15, 18, 255),
+        TextPrimary = Color(245, 245, 245, 255),
+        TextSecondary = Color(140, 140, 150, 255),
+        UIElement = Color(30, 30, 35, 255),
+        Highlight = Color(255, 255, 255, 15), 
+        ActiveToggle = Color(0, 180, 255, 255),
+        VisTop = Color(0, 255, 200, 255),
+        VisBot = Color(0, 100, 255, 255)
+    },
+    
+    Playlist = { --add another line to add more music to your playlist, example: { title = "Track 3", artist = "Unknown", url = "PLACE_LINK_HERE" },
+        { title = "Track 1", artist = "Unknown", url = "PLACE_LINK_HERE" },
+        { title = "Track 2", artist = "Unknown", url = "PLACE_LINK_HERE" }
+    }
+}
+
+if SERVER then
+    local yamaState = {
+        playing = false,
+        trackIdx = 1,
+        radioEnt = nil,
+        headphones = false,
+        seekTime = 0,
+        lastUpdate = timer.curtime()
+    }
+
+    local function yamaGetActualTime()
+        if not yamaState.playing then return yamaState.seekTime end
+        return yamaState.seekTime + (timer.curtime() - yamaState.lastUpdate)
+    end
+
+    local function yamaSync()
+        net.start("Yama_Music_Sync")
+        net.writeBool(yamaState.playing)
+        net.writeUInt(yamaState.trackIdx, 8)
+        
+        local hasRadio = isValid(yamaState.radioEnt)
+        net.writeBool(hasRadio)
+        if hasRadio then net.writeEntity(yamaState.radioEnt) end
+        
+        net.writeBool(yamaState.headphones)
+        net.writeFloat(yamaGetActualTime())
+        net.send()
+    end
+
+    net.receive("Yama_Music_Control", function(len, ply)
+        if ply ~= owner() then return end
+        
+        local action = net.readString()
+        local currentTime = timer.curtime()
+
+        if action == "PLAYPAUSE" then
+            yamaState.playing = not yamaState.playing
+            if yamaState.playing then
+                yamaState.lastUpdate = currentTime
+            else
+                yamaState.seekTime = yamaGetActualTime()
+            end
+        elseif action == "NEXT" then
+            yamaState.trackIdx = (yamaState.trackIdx % #YAMA_CFG.Playlist) + 1
+            yamaState.seekTime = 0
+            yamaState.lastUpdate = currentTime
+            yamaState.playing = true
+        elseif action == "PREV" then
+            yamaState.trackIdx = yamaState.trackIdx - 1
+            if yamaState.trackIdx < 1 then yamaState.trackIdx = #YAMA_CFG.Playlist end
+            yamaState.seekTime = 0
+            yamaState.lastUpdate = currentTime
+            yamaState.playing = true
+        elseif action == "SEEK" then
+            yamaState.seekTime = net.readFloat()
+            yamaState.lastUpdate = currentTime
+        elseif action == "RADIO" then
+            if isValid(yamaState.radioEnt) then
+                yamaState.radioEnt:remove()
+                yamaState.radioEnt = nil
+                yamaSync()
+            else
+                yamaState.radioEnt = prop.create(ply:getPos() + Vector(0, 0, 40), Angle(0, 0, 0), "models/props_lab/citizenradio.mdl")
+                if isValid(yamaState.radioEnt) then yamaState.radioEnt:setSolid(0) end
+                timer.simple(0.1, yamaSync)
+            end
+            return
+        elseif action == "HEADPHONES" then
+            yamaState.headphones = not yamaState.headphones
+        end
+        
+        yamaSync()
+    end)
+
+    hook.add("PlayerInitialSpawn", "YamaSyncNewPly", function(ply)
+        timer.simple(1, yamaSync)
+    end)
+
+else
+    local yamaOwner = owner()
+    local yamaIsOwner = (player() == yamaOwner)
+    
+    local yama_floor, yama_clamp = math.floor, math.clamp
+
+    local yamaSettings = { Vol = 1.0, Dist = 1500, Pitch = 1.0 }
+    local yamaState = { playing = false, trackIdx = 1, radioEnt = nil, headphones = false, time = 0 }
+
+    local yamaSnd = nil
+    local yamaFFT = {}
+
+    local function yamaApplyAudio()
+        if not isValid(yamaSnd) then return end
+        local v = yamaIsOwner and yamaSettings.Vol or 1.0 
+        yamaSnd:setVolume(v)
+        yamaSnd:setFade(100, yamaIsOwner and yamaSettings.Dist or 1500)
+        yamaSnd:setPitch(yamaIsOwner and yamaSettings.Pitch or 1.0)
+    end
+
+    local function yamaLoadAudio()
+        if isValid(yamaSnd) then yamaSnd:stop() yamaSnd = nil end
+        if yamaState.headphones and not yamaIsOwner then return end
+
+        local track = YAMA_CFG.Playlist[yamaState.trackIdx]
+        if not track then return end
+
+        bass.loadURL(track.url, "3d noblock play", function(audio)
+            if not audio then return end
+            yamaSnd = audio
+            yamaApplyAudio()
+            yamaSnd:setTime(yamaState.time)
+            if not yamaState.playing then yamaSnd:pause() end
+        end)
+    end
+
+    net.receive("Yama_Music_Sync", function()
+        local n_play = net.readBool()
+        local n_idx = net.readUInt(8)
+        local hasRadio = net.readBool()
+        local n_ent = hasRadio and net.readEntity() or nil
+        local n_hp = net.readBool()
+        local n_time = net.readFloat()
+
+        local trackChanged = (n_idx ~= yamaState.trackIdx) or (n_hp ~= yamaState.headphones)
+        local seekChanged = math.abs(n_time - yamaState.time) > 2
+
+        yamaState.playing = n_play
+        yamaState.trackIdx = n_idx
+        yamaState.radioEnt = n_ent
+        yamaState.headphones = n_hp
+        yamaState.time = n_time
+
+        if yamaUI then yamaUI.needsUpdate = true end 
+
+        if trackChanged then
+            yamaLoadAudio()
+        else
+            if isValid(yamaSnd) then
+                if yamaState.playing then yamaSnd:play() else yamaSnd:pause() end
+                if seekChanged then
+                    local len = yamaSnd:getLength()
+                    if len > 0 then yamaSnd:setTime(n_time) end
+                end
+            elseif yamaState.playing then
+                yamaLoadAudio()
+            end
+        end
+    end)
+
+    hook.add("Think", "YamaAudioPos", function()
+        if not isValid(yamaSnd) then return end
+        if isValid(yamaState.radioEnt) then
+            yamaSnd:setPos(yamaState.radioEnt:getPos())
+        else
+            yamaSnd:setPos(yamaOwner:obbCenterW())
+        end
+    end)
+
+    if yamaIsOwner then
+        enableHud(player(), true)
+        
+        local yamaTitleFont = render.createFont("Roboto", 24, 800, true)
+        local yamaSubFont = render.createFont("Roboto", 18, 500, true)
+        local yamaTimeFont = render.createFont("Courier New", 14, 800, true)
+        local r_color, r_rect = render.setColor, render.drawRect
+
+        yamaUI = {
+            open = false,
+            settingsOpen = false,
+            draggingSeek = false,
+            activeSlider = nil, 
+            seekFrac = 0,
+            needsUpdate = true,
+            lastHover = "",
+            rtName = "YamaWinampRTV5"
+        }
+
+        render.createRenderTarget(yamaUI.rtName, 1024, 1024)
+        yamaUI.rtMat = material.create("UnlitGeneric")
+        yamaUI.rtMat:setInt("$translucent", 1)
+        yamaUI.rtMat:setInt("$vertexalpha", 1) 
+        yamaUI.rtMat:setInt("$vertexcolor", 1) 
+        yamaUI.rtMat:setTextureRenderTarget("$basetexture", yamaUI.rtName)
+
+        local function yamaGetPanelGeom(sw, sh)
+            local px = yama_floor((sw - YAMA_CFG.UI_Width) / 2)
+            local py = yama_floor((sh - YAMA_CFG.UI_Height) / 2)
+            return px, py, YAMA_CFG.UI_Width, YAMA_CFG.UI_Height
+        end
+
+        local function yamaHit(rx, ry, rw, rh, mx, my)
+            return mx >= rx and mx <= rx + rw and my >= ry and my <= ry + rh
+        end
+
+        local yamaHUDHide = {}
+        hook.add("HUDShouldDraw", "YamaHideCrosshair", function(name)
+            if not yamaUI.open then return end
+            if yamaHUDHide[name] == nil then
+                local lowerName = name:lower()
+                yamaHUDHide[name] = (lowerName:find("crosshair") or lowerName:find("reticle") or lowerName:find("aim")) and true or false
+            end
+            if yamaHUDHide[name] then return false end
+        end)
+
+        local function yamaSendAction(action, val)
+            net.start("Yama_Music_Control")
+            net.writeString(action)
+            if val ~= nil then net.writeFloat(val) end
+            net.send()
+        end
+
+        hook.add("inputPressed", "YamaUIInput", function(k)
+            if k == YAMA_CFG.UI_KeyBind then
+                yamaUI.open = not yamaUI.open
+                input.enableCursor(yamaUI.open)
+                return
+            end
+
+            if not yamaUI.open then return end
+            
+            if k == YAMA_CFG.MOUSE_LEFT then
+                local mx, my = input.getCursorPos()
+                local sw, sh = render.getGameResolution()
+                local px, py, pw, ph = yamaGetPanelGeom(sw, sh)
+                
+                if yamaHit(px + pw - 30, py + 5, 25, 25, mx, my) then yamaUI.open = false input.enableCursor(false) return end
+                if yamaHit(px + 10, py + 5, 80, 25, mx, my) then 
+                    yamaUI.settingsOpen = not yamaUI.settingsOpen 
+                    yamaUI.needsUpdate = true
+                    return 
+                end
+                
+                if yamaUI.settingsOpen then
+                    local sX, sW = px + 100, pw - 140
+                    if yamaHit(sX, py + 100 - 10, sW, 30, mx, my) then yamaUI.activeSlider = "vol" return end
+                    if yamaHit(sX, py + 160 - 10, sW, 30, mx, my) then yamaUI.activeSlider = "dist" return end
+                    if yamaHit(sX, py + 220 - 10, sW, 30, mx, my) then yamaUI.activeSlider = "pitch" return end
+                    return
+                end
+
+                local seekX, seekY, seekW, seekH = px + 20, py + 290, pw - 40, 15
+                if yamaHit(seekX, seekY - 5, seekW, seekH + 10, mx, my) then 
+                    local len = isValid(yamaSnd) and yamaSnd:getLength() or 0
+                    if len > 0 then yamaUI.draggingSeek = true end
+                    return 
+                end
+
+                local cx = px + pw / 2
+                if yamaHit(cx - 105, py + 335, 60, 50, mx, my) then yamaSendAction("PREV") return end
+                if yamaHit(cx - 35, py + 335, 70, 50, mx, my) then yamaSendAction("PLAYPAUSE") return end
+                if yamaHit(cx + 45, py + 335, 60, 50, mx, my) then yamaSendAction("NEXT") return end
+                
+                if yamaHit(px + 20, py + 340, 100, 40, mx, my) then yamaSendAction("RADIO") return end
+                if yamaHit(px + pw - 120, py + 340, 120, 40, mx, my) then yamaSendAction("HEADPHONES") return end
+            end
+        end)
+
+        hook.add("inputReleased", "YamaUIInputRel", function(k)
+            if k == YAMA_CFG.MOUSE_LEFT then
+                if yamaUI.draggingSeek then
+                    yamaUI.draggingSeek = false
+                    if isValid(yamaSnd) then
+                        local len = yamaSnd:getLength()
+                        if len > 0 then yamaSendAction("SEEK", yamaUI.seekFrac * len) end
+                    end
+                end
+                yamaUI.activeSlider = nil
+            end
+        end)
+
+        hook.add("think", "YamaUIDrag", function()
+            if not yamaUI.open then return end
+            local mx, my = input.getCursorPos()
+            local sw, sh = render.getGameResolution()
+            local px, py, pw, ph = yamaGetPanelGeom(sw, sh)
+
+            if yamaUI.draggingSeek then
+                local seekX, seekW = px + 20, pw - 40
+                yamaUI.seekFrac = yama_clamp((mx - seekX) / seekW, 0, 1)
+            end
+
+            if yamaUI.activeSlider then
+                local sX, sW = px + 100, pw - 140
+                local frac = yama_clamp((mx - sX) / sW, 0, 1)
+                
+                if yamaUI.activeSlider == "vol" then
+                    yamaSettings.Vol = frac * 5
+                elseif yamaUI.activeSlider == "dist" then
+                    yamaSettings.Dist = 100 + (frac * 2400)
+                elseif yamaUI.activeSlider == "pitch" then
+                    yamaSettings.Pitch = 0.1 + (frac * 2.9)
+                end
+                yamaApplyAudio()
+            end
+        end)
+
+        local function yamaFormatTime(seconds)
+            local m = yama_floor(seconds / 60)
+            local s = yama_floor(seconds % 60)
+            return string.format("%02d:%02d", m, s)
+        end
+
+        local function yamaUpdateRT(sw, sh, px, py, pw, ph)
+            render.selectRenderTarget(yamaUI.rtName)
+            render.clear(Color(0, 0, 0, 0))
+            
+            local m = Matrix()
+            m:setTranslation(Vector(-px, -py, 0))
+            render.pushMatrix(m, true)
+
+            r_color(YAMA_CFG.Colors.BG)
+            r_rect(px, py, pw, ph)
+            r_color(YAMA_CFG.Colors.Header)
+            r_rect(px, py, pw, 35)
+            r_color(Color(5, 5, 5, 255))
+            render.drawRectOutline(px, py, pw, ph, 2)
+            r_rect(px, py + 35, pw, 2)
+
+            render.setFont(yamaSubFont)
+            r_color(YAMA_CFG.Colors.TextPrimary)
+            render.drawSimpleText(px + pw/2, py + 17, "Music Player", 1, 1)
+            render.drawSimpleText(px + pw - 17, py + 17, "X", 1, 1)
+            
+            r_color(YAMA_CFG.Colors.UIElement)
+            r_rect(px + 10, py + 5, 80, 25)
+            r_color(Color(0,0,0,255))
+            render.drawRectOutline(px + 10, py + 5, 80, 25, 1)
+            r_color(YAMA_CFG.Colors.TextPrimary)
+            render.drawSimpleText(px + 50, py + 17, "Settings", 1, 1)
+
+            if yamaUI.settingsOpen then
+                render.setFont(yamaTitleFont)
+                render.drawSimpleText(px + pw/2, py + 55, "YAMA AUDIO SETTINGS", 1, 0)
+                
+                local labels = {"VOLUME", "DISTANCE", "PITCH"}
+                for i, l in ipairs(labels) do
+                    render.setFont(yamaSubFont)
+                    r_color(YAMA_CFG.Colors.TextSecondary)
+                    render.drawSimpleText(px + 20, py + 40 + (i * 60), l, 0, 1)
+                    
+                    r_color(Color(20, 20, 30))
+                    r_rect(px + 100, py + 45 + (i * 60), pw - 140, 10)
+                end
+            else
+                r_color(YAMA_CFG.Colors.Panel)
+                r_rect(px + 10, py + 45, pw - 20, 180)
+
+                r_color(Color(15, 15, 18, 255))
+                r_rect(px + 20, py + 290, pw - 40, 12)
+
+                local function drawBtnBase(x, y, w, h, txt, active)
+                    r_color(active and YAMA_CFG.Colors.ActiveToggle or YAMA_CFG.Colors.UIElement)
+                    r_rect(x, y, w, h)
+                    r_color(Color(0, 0, 0, 255))
+                    render.drawRectOutline(x, y, w, h, 1)
+                    render.setFont(yamaTitleFont)
+                    r_color(active and Color(0,0,0) or YAMA_CFG.Colors.TextPrimary)
+                    render.drawSimpleText(x + w / 2, y + h / 2, txt, 1, 1)
+                end
+
+                local cx = px + pw / 2
+                drawBtnBase(cx - 105, py + 335, 60, 50, "|<", false)
+                drawBtnBase(cx - 35, py + 335, 70, 50, yamaState.playing and "||" or ">", false)
+                drawBtnBase(cx + 45, py + 335, 60, 50, ">|", false)
+                
+                drawBtnBase(px + 20, py + 340, 100, 40, "Radio", isValid(yamaState.radioEnt))
+                drawBtnBase(px + pw - 140, py + 340, 120, 40, "Headphones", yamaState.headphones)
+            end
+
+            render.popMatrix()
+            render.selectRenderTarget()
+            yamaUI.needsUpdate = false
+        end
+
+        local function yamaDrawHover(x, y, w, h, mx, my)
+            if yamaHit(x, y, w, h, mx, my) then
+                r_color(YAMA_CFG.Colors.Highlight)
+                r_rect(x, y, w, h)
+                return true
+            end
+            return false
+        end
+
+        hook.add("drawhud", "YamaDrawWinamp", function()
+            if not yamaUI.open then return end
+
+            local sw, sh = render.getGameResolution()
+            local px, py, pw, ph = yamaGetPanelGeom(sw, sh)
+            local mx, my = input.getCursorPos()
+
+            local cx = px + pw / 2
+            local curHover = ""
+            
+            if yamaHit(px + 10, py + 5, 80, 25, mx, my) then curHover = "settings"
+            elseif yamaHit(px + pw - 30, py + 5, 25, 25, mx, my) then curHover = "close"
+            elseif not yamaUI.settingsOpen then
+                if yamaHit(cx - 105, py + 335, 60, 50, mx, my) then curHover = "prev"
+                elseif yamaHit(cx - 35, py + 335, 70, 50, mx, my) then curHover = "play"
+                elseif yamaHit(cx + 45, py + 335, 60, 50, mx, my) then curHover = "next"
+                elseif yamaHit(px + 20, py + 340, 100, 40, mx, my) then curHover = "rad"
+                elseif yamaHit(px + pw - 120, py + 340, 120, 40, mx, my) then curHover = "hp"
+                end
+            end
+
+            if curHover ~= yamaUI.lastHover then
+                yamaUI.lastHover = curHover
+                yamaUI.needsUpdate = true
+            end
+
+            if yamaUI.needsUpdate then yamaUpdateRT(sw, sh, px, py, pw, ph) end
+
+            render.setMaterial(yamaUI.rtMat)
+            render.setRGBA(255, 255, 255, 255)
+            render.drawTexturedRectUV(px, py, pw, ph, 0, 0, pw / 1024, ph / 1024)
+
+            yamaDrawHover(px + 10, py + 5, 80, 25, mx, my)
+            if yamaDrawHover(px + pw - 30, py + 5, 25, 25, mx, my) then
+                r_color(Color(200, 50, 50, 255))
+                r_rect(px + pw - 30, py + 5, 25, 25)
+                r_color(Color(255, 255, 255, 255))
+                render.setFont(yamaSubFont)
+                render.drawSimpleText(px + pw - 17, py + 17, "X", 1, 1)
+            end
+
+            if yamaUI.settingsOpen then
+                local sX, sW = px + 100, pw - 140
+                
+                local vFrac = yamaSettings.Vol / 5
+                local dFrac = (yamaSettings.Dist - 100) / 2400
+                local pFrac = (yamaSettings.Pitch - 0.1) / 2.9
+
+                r_color(YAMA_CFG.Colors.ActiveToggle)
+                r_rect(sX, py + 105, sW * vFrac, 10)
+                r_rect(sX, py + 165, sW * dFrac, 10)
+                r_rect(sX, py + 225, sW * pFrac, 10)
+
+                render.setFont(yamaTimeFont)
+                r_color(YAMA_CFG.Colors.TextPrimary)
+                render.drawSimpleText(sX + sW - 20, py + 95, string.format("%.1f", yamaSettings.Vol), 1, 1)
+                render.drawSimpleText(sX + sW - 20, py + 155, yama_floor(yamaSettings.Dist) .. "u", 1, 1)
+                render.drawSimpleText(sX + sW - 20, py + 215, string.format("%.2fx", yamaSettings.Pitch), 1, 1)
+            else
+                yamaDrawHover(cx - 105, py + 335, 60, 50, mx, my)
+                yamaDrawHover(cx - 35, py + 335, 70, 50, mx, my)
+                yamaDrawHover(cx + 45, py + 335, 60, 50, mx, my)
+                yamaDrawHover(px + 20, py + 340, 100, 40, mx, my)
+                yamaDrawHover(px + pw - 140, py + 340, 120, 40, mx, my)
+
+                if isValid(yamaSnd) and yamaState.playing then
+                    yamaFFT = yamaSnd:getFFT(0)
+                else
+                    for i = 1, 32 do yamaFFT[i] = 0 end
+                end
+
+                local visX, visY, visW, visH = px + 10, py + 45, pw - 20, 180
+                local barCount = 32
+                local space = 2
+                local barW = (visW - (space * (barCount - 1))) / barCount
+
+                for i = 1, barCount do
+                    local val = yama_clamp((yamaFFT[i] or 0) * 12, 0, 1)
+                    if val > 0.05 then
+                        local bx = visX + (i - 1) * (barW + space)
+                        local barHeight = val * visH
+                        local by = visY + visH - barHeight
+                        
+                        r_color(Color(
+                            YAMA_CFG.Colors.VisBot.r + (YAMA_CFG.Colors.VisTop.r - YAMA_CFG.Colors.VisBot.r) * val,
+                            YAMA_CFG.Colors.VisBot.g + (YAMA_CFG.Colors.VisTop.g - YAMA_CFG.Colors.VisBot.g) * val,
+                            YAMA_CFG.Colors.VisBot.b + (YAMA_CFG.Colors.VisTop.b - YAMA_CFG.Colors.VisBot.b) * val,
+                            255
+                        ))
+                        r_rect(bx, by, barW, barHeight)
+                    end
+                end
+
+                local track = YAMA_CFG.Playlist[yamaState.trackIdx] or {title = "Unknown", artist = "Unknown"}
+                render.setFont(yamaTitleFont)
+                r_color(YAMA_CFG.Colors.TextPrimary)
+                render.drawSimpleText(px + pw/2, py + 240, track.title, 1, 0)
+                render.setFont(yamaSubFont)
+                r_color(YAMA_CFG.Colors.TextSecondary)
+                render.drawSimpleText(px + pw/2, py + 265, track.artist, 1, 0)
+
+                local currentFrac = yamaUI.seekFrac
+                local curTime, totalTime = 0, 0
+                
+                if not yamaUI.draggingSeek and isValid(yamaSnd) then
+                    totalTime = yamaSnd:getLength()
+                    curTime = yamaSnd:getTime()
+                    if totalTime > 0 then
+                        currentFrac = curTime / totalTime
+                    else
+                        currentFrac = 0
+                    end
+                end
+
+                r_color(YAMA_CFG.Colors.ActiveToggle)
+                r_rect(px + 20, py + 290, (pw - 40) * currentFrac, 12)
+                
+                render.setFont(yamaTimeFont)
+                r_color(YAMA_CFG.Colors.TextPrimary)
+                local timeStr = totalTime > 0 and (yamaFormatTime(curTime) .. " / " .. yamaFormatTime(totalTime)) or "LIVE STREAM"
+                render.drawSimpleText(px + pw - 20, py + 310, timeStr, 2, 1)
+            end
+        end)
+    end
+end
