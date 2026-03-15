@@ -1,0 +1,1663 @@
+--@name Music Player
+--@author Yamachinima
+--@realm shared
+
+local YAMA_CFG = { --open the UI by pressing F2, keybinds can be changed in settings
+    
+Playlist = { --add hardcoded links here
+        --{ title = "Track 1", artist = "Unknown", url = "PLACE_LINK_HERE" },
+        --{ title = "Track 2", artist = "Unknown", url = "PLACE_LINK_HERE" },
+        --{ title = "Track 3", artist = "Unknown", url = "PLACE_LINK_HERE" }
+    },
+    
+    UI_Width = 800,
+    UI_Height = 520,
+    UI_Scale = 1.0,
+    UI_KeyBind = 93, --F2
+    MOUSE_LEFT  = 107,          -- KEY_MOUSE1 (left mouse button)
+    MOUSE_RIGHT = 108,          -- KEY_MOUSE2 (right mouse button)
+
+    -- Tuning constants (all magic numbers live here for easy adjustment)
+    TRACK_IDX_BITS  = 16,       -- bit-width for track index net messages (supports up to 65535 tracks)
+    DEBOUNCE_TIME   = 0.25,     -- minimum seconds between server control actions
+    PRECACHE_LEAD   = 5,        -- seconds before track end to start loading the next track
+    DURATION_GUARD  = 1.5,      -- padding added to reported duration so server fires after the track ends, not before
+    MUFFLE_INTERVAL = 0.1,      -- seconds between line-of-sight muffle traces
+    MAX_DURATION    = 36000,    -- server-side cap for accepted track duration (10 hours)
+    QUEUE_VISIBLE   = 6,        -- number of tracks visible at once in the queue panel
+    SEEK_BAR_Y      = 370,      -- Y offset from panel origin for the seek bar (shared by yamaUpdateRT and drawHUD)
+    
+    Colors = {
+        BG_Main = Color(15, 15, 18, 250), 
+        BG_Input = Color(25, 25, 30, 255),    
+        Accent = Color(110, 40, 200, 255), 
+        AccentHover = Color(140, 70, 230, 255),
+        TextPrimary = Color(240, 240, 245, 255),
+        TextDim = Color(120, 120, 130, 255),
+        VisTop = Color(160, 80, 255, 255),
+        VisBot = Color(60, 20, 120, 255)
+    }
+}
+
+
+local YAMA_AUDIO_EXTS = { mp3 = true, ogg = true, wav = true, flac = true, aac = true, opus = true }
+local function yamaValidateURL(url)
+    if type(url) ~= "string" then return false end
+    
+    local rest = string.match(url, "^https?://(.+)$")
+    if not rest then return false end
+
+    local host = string.match(rest, "^([^/?#]+)")
+    if not host or not string.find(host, ".", 1, true) then return false end
+
+    local path = string.match(rest, "^([^?#]+)")
+    if not path then return false end
+
+    if string.find(path, "%.%./") or string.find(path, "/%./") then return false end
+
+    -- Google Drive raw download URLs have no file extension but are valid audio sources
+    if string.find(string.lower(host), "drive%.google%.com") then return true end
+    
+    local ext = string.match(string.lower(path), "%.([a-z0-9]+)$")
+    
+    if not ext or not YAMA_AUDIO_EXTS[ext] then return false end
+    return true
+end
+
+if SERVER then
+    local function yamaRunSelfTests()
+        local pass, fail = 0, 0
+        local function expect(label, got, want)
+            if got == want then
+                pass = pass + 1
+            else
+                fail = fail + 1
+                print("[SELF-TEST] FAIL: " .. label .. "  expected " .. tostring(want) .. " got " .. tostring(got))
+            end
+        end
+
+        -- Valid URLs
+        expect("valid mp3",     yamaValidateURL("https://raw.githubusercontent.com/x/y/main/track.mp3"), true)
+        expect("valid ogg",     yamaValidateURL("http://example.com/audio.ogg"),  true)
+        expect("valid opus",    yamaValidateURL("https://cdn.site.com/file.opus"), true)
+        expect("query strip",   yamaValidateURL("https://cdn.site.com/file.mp3?v=123"), true)
+
+        -- Invalid URLs
+        expect("no protocol",   yamaValidateURL("example.com/track.mp3"),          false)
+        expect("no extension",  yamaValidateURL("https://example.com/track"),       false)
+        expect("bad extension", yamaValidateURL("https://example.com/track.php"),   false)
+        expect("no host dot",   yamaValidateURL("https://localhost/track.mp3"),     false)
+        expect("empty string",  yamaValidateURL(""),                                false)
+        expect("not a string",  yamaValidateURL(nil),                               false)
+        expect("path injection",yamaValidateURL("https://evil.com/../etc/passwd.mp3"), false)
+        expect("ext injection", yamaValidateURL("https://evil.com/real.mp3/exploit"), false)
+
+        if fail == 0 then
+            print("[SELF-TEST] All " .. pass .. " URL validation tests passed.")
+        else
+            print("[SELF-TEST] " .. fail .. " FAILED, " .. pass .. " passed. Check output above.")
+        end
+    end
+    yamaRunSelfTests()
+end
+
+-- ============================================================================
+-- SERVER LOGIC
+-- ============================================================================
+if SERVER then
+    local t_curtime = timer.curtime
+    
+    local yamaState = {
+        playing = false, looping = false, shuffle = false, autoplay = true,
+        trackIdx = 1, nextTrackIdx = 2, pCount = #YAMA_CFG.Playlist,
+        radioEnt = nil, headphones = false, seekTime = 0, lastUpdate = 0, duration = 0,
+        durationConfirmed = false  -- set when Yama_Report_Length is received; cleared on track/mode change
+    }
+    
+    local yamaLastAction = 0
+
+    local function yamaGetActualTime()
+        if not yamaState.playing then return yamaState.seekTime end
+        if yamaState.lastUpdate == 0 then return yamaState.seekTime end
+        return yamaState.seekTime + (t_curtime() - yamaState.lastUpdate)
+    end
+
+    local function yamaCalcNext()
+        if yamaState.pCount <= 1 then return 1 end  
+        if yamaState.looping then return yamaState.trackIdx end
+        if yamaState.shuffle then
+            local n = math.random(1, yamaState.pCount)
+
+            if n == yamaState.trackIdx then n = (n % yamaState.pCount) + 1 end
+            return n
+        end
+        return (yamaState.trackIdx % yamaState.pCount) + 1
+    end
+
+
+    local function yamaSync()
+        net.start("Yama_Music_Sync")
+        net.writeBool(yamaState.playing)
+        net.writeBool(yamaState.looping)
+        net.writeBool(yamaState.shuffle)
+        net.writeBool(yamaState.autoplay)
+        net.writeUInt(yamaState.trackIdx, YAMA_CFG.TRACK_IDX_BITS)
+        net.writeUInt(yamaState.nextTrackIdx, YAMA_CFG.TRACK_IDX_BITS)
+        
+        local hasRadio = isValid(yamaState.radioEnt)
+        net.writeBool(hasRadio)
+        if hasRadio then net.writeEntity(yamaState.radioEnt) end
+        
+        net.writeBool(yamaState.headphones)
+        net.writeFloat(yamaGetActualTime())
+        net.send()
+    end
+
+    timer.create("Yama_Delta_Sync", 10, 0, function() yamaSync() end)
+
+    net.receive("Yama_Sync_Count", function(len, ply)
+        if ply ~= owner() then return end
+        yamaState.pCount = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+        yamaState.nextTrackIdx = yamaCalcNext()
+        yamaSync()
+    end)
+
+        net.receive("Yama_Report_Length", function(len, ply)
+        if ply ~= owner() then return end
+        local reported = net.readFloat()
+
+        if reported > 0 and reported <= YAMA_CFG.MAX_DURATION then
+            -- Reject partial lengths reported during mid-track stream reloads
+            if not yamaState.durationConfirmed or reported > yamaState.duration then
+                yamaState.duration = reported
+                yamaState.durationConfirmed = true
+            end
+        end
+    end)
+
+    hook.add("PlayerSay", "Yama_ChatInput", function(ply, txt)
+        if ply ~= owner() then return end
+        local lowerTxt = string.lower(txt)
+        
+        if string.sub(lowerTxt, 1, 10) == "!addmusic " then
+            local url = string.trim(string.sub(txt, 11))
+
+            -- Google Drive links must be converted client-side as http.urlGoogleDriveToRaw
+            -- is only available on the client realm. Send to owner's client to convert.
+            if string.find(string.lower(url), "drive%.google%.com") then
+                net.start("Yama_Convert_Drive")
+                net.writeString(url)
+                net.send(ply)
+                return ""
+            end
+
+            if not yamaValidateURL(url) then
+                ply:chatPrint("[Player OS] Invalid URL. Must be http(s)://domain.tld/file.mp3 (mp3/ogg/wav/flac/aac/opus)")
+                return ""
+            end
+            net.start("Yama_Sync_Track")
+            net.writeString(url)
+            net.send()
+            return "" 
+        elseif string.sub(lowerTxt, 1, 13) == "!removemusic " then
+            local url = string.trim(string.sub(txt, 14))
+            if not yamaValidateURL(url) then
+                ply:chatPrint("[Player OS] Invalid URL. Must be http(s)://domain.tld/file.mp3 (mp3/ogg/wav/flac/aac/opus)")
+                return ""
+            end
+            net.start("Yama_Sync_Remove_URL")
+            net.writeString(url)
+            net.send()
+            return ""
+        elseif string.sub(lowerTxt, 1, 6) == "!name " then
+            local newTitle = string.trim(string.sub(txt, 7))
+            if #newTitle == 0 or #newTitle > 128 then
+                ply:chatPrint("[Music Player] Usage: !name <NewTrackName>  (1128 characters)")
+                return ""
+            end
+            net.start("Yama_Apply_Rename")
+            net.writeString(newTitle)
+            net.send(ply)
+            return ""
+        elseif string.sub(lowerTxt, 1, 8) == "!artist " then
+            local newArtist = string.trim(string.sub(txt, 9))
+            if #newArtist == 0 or #newArtist > 128 then
+                ply:chatPrint("[Music Player] Usage: !artist <ArtistName>  (1128 characters)")
+                return ""
+            end
+            net.start("Yama_Apply_Artist")
+            net.writeString(newArtist)
+            net.send(ply)
+            return ""
+        end
+    end)
+
+
+    net.receive("Yama_Music_Control", function(len, ply)
+        if ply ~= owner() then return end
+        
+        local currentTime = t_curtime()
+        if currentTime - yamaLastAction < YAMA_CFG.DEBOUNCE_TIME then return end
+        yamaLastAction = currentTime
+
+        local action = net.readString()
+
+        if action == "TRACK_END" then
+            if yamaState.looping then
+                yamaState.seekTime = 0
+                yamaState.lastUpdate = currentTime
+            elseif yamaState.autoplay then
+                yamaState.trackIdx = yamaState.nextTrackIdx
+                yamaState.nextTrackIdx = yamaCalcNext()
+                yamaState.seekTime = 0
+                yamaState.lastUpdate = currentTime
+                yamaState.playing = true
+                yamaState.duration = 0
+                yamaState.durationConfirmed = false
+            else
+                yamaState.playing = false
+                yamaState.seekTime = 0
+            end
+        end
+
+        if action == "PLAYPAUSE" then
+            yamaState.playing = not yamaState.playing
+            if yamaState.playing then
+                yamaState.lastUpdate = currentTime
+            else
+                yamaState.seekTime = yamaGetActualTime()
+            end
+        elseif action == "NEXT" then
+            yamaState.trackIdx = yamaState.nextTrackIdx
+            yamaState.nextTrackIdx = yamaCalcNext()
+            yamaState.seekTime = 0
+            yamaState.lastUpdate = currentTime
+            yamaState.playing = true
+            yamaState.duration = 0
+            yamaState.durationConfirmed = false
+        elseif action == "PREV" then
+            yamaState.trackIdx = yamaState.trackIdx - 1
+            if yamaState.trackIdx < 1 then yamaState.trackIdx = yamaState.pCount end
+            yamaState.nextTrackIdx = yamaCalcNext()
+            yamaState.seekTime = 0
+            yamaState.lastUpdate = currentTime
+            yamaState.playing = true
+            yamaState.duration = 0
+            yamaState.durationConfirmed = false
+        elseif action == "SEEK" then
+            local seekVal = net.readFloat()
+            -- Clamp to valid range; reject NaN/inf by guarding with MAX_DURATION
+            if type(seekVal) == "number" and seekVal >= 0 and seekVal <= YAMA_CFG.MAX_DURATION then
+                yamaState.seekTime = seekVal
+                yamaState.lastUpdate = currentTime
+            end
+        elseif action == "JUMPTO" then
+            local idx = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+            if idx >= 1 and idx <= yamaState.pCount then
+                local changing = (idx ~= yamaState.trackIdx)
+                yamaState.trackIdx = idx
+                yamaState.nextTrackIdx = yamaCalcNext()
+                yamaState.seekTime = 0
+                yamaState.lastUpdate = currentTime
+                yamaState.playing = true
+                -- Only wipe duration knowledge when actually switching tracks.
+                -- Preserving durationConfirmed on same-track jump lets the
+                -- progression timer keep firing without waiting for a new report.
+                if changing then
+                    yamaState.duration = 0
+                    yamaState.durationConfirmed = false
+                end
+            end
+        elseif action == "LOOP" then 
+            yamaState.looping = not yamaState.looping
+            yamaState.nextTrackIdx = yamaCalcNext()
+        elseif action == "SHUFFLE" then 
+            yamaState.shuffle = not yamaState.shuffle
+            yamaState.nextTrackIdx = yamaCalcNext()
+        elseif action == "AUTOPLAY" then 
+            yamaState.autoplay = not yamaState.autoplay
+            yamaState.nextTrackIdx = yamaCalcNext()
+        elseif action == "RADIO" then
+            if isValid(yamaState.radioEnt) then
+                yamaState.radioEnt:remove()
+                yamaState.radioEnt = nil
+            else
+                local spawnPos = ply:getEyePos() + (ply:getEyeAngles():getForward() * 30) + Vector(0, 0, 10)
+                yamaState.radioEnt = prop.create(spawnPos, Angle(0, 0, 0), "models/props_lab/citizenradio.mdl")
+                if isValid(yamaState.radioEnt) then yamaState.radioEnt:setSolid(0) end
+                yamaState.headphones = false
+            end
+
+            yamaState.seekTime = yamaGetActualTime()
+            yamaState.lastUpdate = currentTime
+            yamaState.duration = 0                  -- REMOVE THIS LINE
+            yamaState.durationConfirmed = false     -- REMOVE THIS LINE
+
+            timer.simple(0.2, yamaSync)
+            return
+        elseif action == "HEADPHONES" then
+            yamaState.headphones = not yamaState.headphones
+
+            if yamaState.headphones and isValid(yamaState.radioEnt) then
+                yamaState.radioEnt:remove()
+                yamaState.radioEnt = nil
+            end
+
+            yamaState.seekTime = yamaGetActualTime()
+            yamaState.lastUpdate = currentTime
+            yamaState.duration = 0                  -- REMOVE THIS LINE
+            yamaState.durationConfirmed = false     -- REMOVE THIS LINE
+        end
+        yamaSync()
+    end)
+
+    net.receive("Yama_Sync_Track", function(len, ply)
+        if ply ~= owner() then return end
+        local url = net.readString()
+        if not yamaValidateURL(url) then return end
+        net.start("Yama_Sync_Track")
+        net.writeString(url)
+        net.send()
+    end)
+
+    net.receive("Yama_Remove_Track", function(len, ply)
+        if ply ~= owner() then return end
+        local idx = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+        net.start("Yama_Sync_Remove")
+        net.writeUInt(idx, YAMA_CFG.TRACK_IDX_BITS)
+        net.send()
+    end)
+
+    -- Owner renamed a track; broadcast the new title to all clients.
+    net.receive("Yama_Rename_Track", function(len, ply)
+        if ply ~= owner() then return end
+        local idx   = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+        local title = net.readString()
+        if idx < 1 or idx > yamaState.pCount then return end
+        if type(title) ~= "string" or #title == 0 or #title > 128 then return end
+        net.start("Yama_Sync_Rename")
+        net.writeUInt(idx, YAMA_CFG.TRACK_IDX_BITS)
+        net.writeString(title)
+        net.send()
+    end)
+
+    -- Owner changed a track artist; broadcast to all clients.
+    net.receive("Yama_Rename_Artist", function(len, ply)
+        if ply ~= owner() then return end
+        local idx    = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+        local artist = net.readString()
+        if idx < 1 or idx > yamaState.pCount then return end
+        if type(artist) ~= "string" or #artist == 0 or #artist > 128 then return end
+        net.start("Yama_Sync_Artist")
+        net.writeUInt(idx, YAMA_CFG.TRACK_IDX_BITS)
+        net.writeString(artist)
+        net.send()
+    end)
+
+    hook.add("PlayerInitialSpawn", "YamaSyncNewPly", function(ply)
+        timer.simple(1, yamaSync)
+    end)
+
+-- ============================================================================
+-- CLIENT LOGIC
+-- ============================================================================
+else
+    local t_curtime, t_frametime = timer.curtime, timer.frametime
+    local m_floor, m_clamp, m_approach = math.floor, math.clamp, math.approach
+
+    local yamaUI = nil 
+    local yamaOwner = owner()
+    local yamaIsOwner = (player() == yamaOwner)
+
+    local yamaSettings = { Vol = 1.0, Dist = 1500, Pitch = 1.0, Muffle = true }
+    local settingsFile = "yama_settings.txt"
+
+    -- Dirty flags: set true when a change is made, flushed to disk by the autosave timer.
+    local yamaDirtySettings = false
+    local yamaDirtyPlaylist = false
+
+    local function saveSettings()
+        if not yamaIsOwner then return end
+        local c = YAMA_CFG.Colors
+        file.write(settingsFile, json.encode({
+            Vol      = yamaSettings.Vol,
+            Dist     = yamaSettings.Dist,
+            Pitch    = yamaSettings.Pitch,
+            Muffle   = yamaSettings.Muffle,
+            KeyBind  = YAMA_CFG.UI_KeyBind,
+            UI_Scale = YAMA_CFG.UI_Scale,
+
+            AccentR  = c.Accent.r,  AccentG  = c.Accent.g,  AccentB  = c.Accent.b,
+            VisTR    = c.VisTop.r,  VisTG    = c.VisTop.g,  VisTB    = c.VisTop.b,
+            VisBR    = c.VisBot.r,  VisBG    = c.VisBot.g,  VisBB    = c.VisBot.b,
+        }))
+        yamaDirtySettings = false
+    end
+
+    local function markSettingsDirty()
+        yamaDirtySettings = true
+    end
+
+    local function loadSettings()
+        if not yamaIsOwner then return end
+        if not file.exists(settingsFile) then return end
+        local data = file.read(settingsFile)
+        if not data or #data == 0 then
+            print("[OS] Settings file is empty, using defaults.")
+            return
+        end
+        local ok, decoded = pcall(json.decode, data)
+        if not ok or type(decoded) ~= "table" then
+            print("[OS] Settings file is corrupt or unreadable, using defaults. (Delete " .. settingsFile .. " to silence this.)")
+            return
+        end
+        if type(decoded.Vol)      == "number"  then yamaSettings.Vol      = math.clamp(decoded.Vol, 0, 5) end
+        if type(decoded.Dist)     == "number"  then yamaSettings.Dist     = math.clamp(decoded.Dist, 100, 2500) end
+        if type(decoded.Pitch)    == "number"  then yamaSettings.Pitch    = math.clamp(decoded.Pitch, 0.1, 3.0) end
+        if type(decoded.Muffle)   == "boolean" then yamaSettings.Muffle   = decoded.Muffle   end
+        if type(decoded.KeyBind)  == "number"  then YAMA_CFG.UI_KeyBind   = decoded.KeyBind  end
+        if type(decoded.UI_Scale) == "number"  then YAMA_CFG.UI_Scale     = decoded.UI_Scale end
+        -- Restore custom theme colors
+        local c = YAMA_CFG.Colors
+        if type(decoded.AccentR) == "number" then c.Accent.r  = decoded.AccentR end
+        if type(decoded.AccentG) == "number" then c.Accent.g  = decoded.AccentG end
+        if type(decoded.AccentB) == "number" then c.Accent.b  = decoded.AccentB end
+        if type(decoded.VisTR)   == "number" then c.VisTop.r  = decoded.VisTR   end
+        if type(decoded.VisTG)   == "number" then c.VisTop.g  = decoded.VisTG   end
+        if type(decoded.VisTB)   == "number" then c.VisTop.b  = decoded.VisTB   end
+        if type(decoded.VisBR)   == "number" then c.VisBot.r  = decoded.VisBR   end
+        if type(decoded.VisBG)   == "number" then c.VisBot.g  = decoded.VisBG   end
+        if type(decoded.VisBB)   == "number" then c.VisBot.b  = decoded.VisBB   end
+    end
+    
+    local yamaState = { 
+        playing = false, looping = false, shuffle = false, autoplay = true, 
+        trackIdx = 1, nextTrackIdx = 2, radioEnt = nil, headphones = false, time = 0,
+        cachedTitle = "No Track Loaded", cachedPrev = "", cachedNext = ""
+    }
+    
+    local targetVolMod, targetPitchMod = 1.0, 1.0
+    local curVolMod = 1.0
+    local lastVol, lastPitch, lastDist = -1, -1, -1
+    local lastRadioPos = Vector(0, 0, 0)
+
+    local yamaSnd = nil
+    local yamaSnd_Precanned = nil
+    local yamaSndIs3D = false
+    local yamaSnd_PrecannedIs3D = false
+    local yamaStreamReady = false
+
+    local yamaFFT = {}
+    local yamaFFT_Smooth = {}
+    for i=1, 32 do yamaFFT[i] = 0 yamaFFT_Smooth[i] = 0 end
+    
+    local yamaLoadID = 0
+    local playlistFile = "yama_winamp_playlist.txt"
+    -- Declared here so the Think hook can write it before any HUD code reads it.
+    local yamaQuotaOverBudget = false
+
+    local function yamaUpdateUICache()
+        local curTrack = YAMA_CFG.Playlist[yamaState.trackIdx]
+        local prevIdx = yamaState.trackIdx - 1
+        if prevIdx < 1 then prevIdx = #YAMA_CFG.Playlist end
+        local prevTrack = YAMA_CFG.Playlist[prevIdx]
+        local nextTrack = YAMA_CFG.Playlist[yamaState.nextTrackIdx]
+
+        yamaState.cachedTitle = curTrack and (curTrack.title .. " - " .. curTrack.artist) or "No Track Loaded"
+        yamaState.cachedPrev = prevTrack and prevTrack.title or ""
+        yamaState.cachedNext = nextTrack and nextTrack.title or ""
+    end
+
+    local function syncServerCount()
+        if not yamaIsOwner then return end
+        net.start("Yama_Sync_Count")
+        net.writeUInt(#YAMA_CFG.Playlist, YAMA_CFG.TRACK_IDX_BITS)
+        net.send()
+    end
+
+    -- Snapshot of hardcoded defaults at chip spawn time, used only to inject
+    -- new defaults that the user has never seen before. Defaults can never
+    -- remove tracks -- only the X button in the menu can do that.
+    local YAMA_DEFAULTS = {}
+    for _, t in ipairs(YAMA_CFG.Playlist) do
+        YAMA_DEFAULTS[t.url] = { title = t.title, artist = t.artist, url = t.url }
+    end
+
+    local function savePlaylist()
+        if not yamaIsOwner then return end
+        -- Save the entire playlist as-is. This is the authoritative source.
+        file.write(playlistFile, json.encode(YAMA_CFG.Playlist))
+        yamaDirtyPlaylist = false
+        syncServerCount()
+    end
+
+    local function markPlaylistDirty()
+        yamaDirtyPlaylist = true
+    end
+
+    local function loadPlaylist()
+        if not yamaIsOwner then return end
+
+        if file.exists(playlistFile) then
+            -- A save file exists: load it as the authoritative playlist.
+            local data = file.read(playlistFile)
+            local decoded = nil
+            if not data or #data == 0 then
+                print("[OS] Playlist file is empty, using hardcoded defaults.")
+            else
+                local ok, result = pcall(json.decode, data)
+                if not ok or type(result) ~= "table" then
+                    print("[OS] Playlist file is corrupt or unreadable, using hardcoded defaults. (Delete " .. playlistFile .. " to silence this.)")
+                else
+                    decoded = result
+                end
+            end
+
+            if decoded and #decoded > 0 then
+                -- Inject any hardcoded defaults the user has never seen before
+                -- (i.e. URLs added to the hardcode after their last session).
+                local savedURLs = {}
+                for _, t in ipairs(decoded) do savedURLs[t.url] = true end
+
+                local newDefaults = {}
+                for _, t in ipairs(YAMA_CFG.Playlist) do
+                    if not savedURLs[t.url] then
+                        table.insert(newDefaults, { title = t.title, artist = t.artist, url = t.url })
+                    end
+                end
+
+                -- Prepend any brand-new defaults, then append the saved list.
+                local merged = {}
+                for _, t in ipairs(newDefaults) do table.insert(merged, t) end
+                for _, t in ipairs(decoded) do
+                    if yamaValidateURL(t.url) then table.insert(merged, t) end
+                end
+
+                YAMA_CFG.Playlist = merged
+                yamaUpdateUICache()
+                syncServerCount()
+                return
+            end
+        end
+
+        -- No save file yet (or corrupt/empty): use the hardcoded defaults as-is and save them.
+        yamaUpdateUICache()
+        savePlaylist()
+        syncServerCount()
+    end
+    if yamaIsOwner then loadSettings() end
+    if yamaIsOwner then loadPlaylist() end
+
+    -- Autosave: flush dirty flags to disk at most once per second.
+        timer.create("Yama_Autosave", 15, 0, function()
+        if yamaDirtySettings then saveSettings() end
+        if yamaDirtyPlaylist  then savePlaylist() end
+    end)
+
+    local function removeTrackGlobal(idx)
+        if not yamaIsOwner then return end
+        local track = YAMA_CFG.Playlist[idx]
+        if not track then return end
+
+        local url = track.url
+        table.remove(YAMA_CFG.Playlist, idx)
+        yamaUpdateUICache()
+        markPlaylistDirty()
+        -- Send the URL, not the index, so non-owner clients remove by URL match
+        -- and can never remove the wrong track if their playlist has drifted.
+        net.start("Yama_Sync_Remove_URL")
+        net.writeString(url)
+        net.send()
+    end
+
+    -- Server asks the owner's client to convert a Google Drive share link,
+    -- since http.urlGoogleDriveToRaw is only available client-side.
+    net.receive("Yama_Convert_Drive", function()
+        if not yamaIsOwner then return end
+        local shareUrl = net.readString()
+        local rawUrl = http.urlGoogleDriveToRaw(shareUrl)
+        if rawUrl then
+            net.start("Yama_Sync_Track")
+            net.writeString(rawUrl)
+            net.send()
+        else
+            print("[OS] Could not convert Google Drive link. Make sure the file is shared publicly.")
+        end
+    end)
+
+    net.receive("Yama_Sync_Track", function()
+        local url = net.readString()
+        if not yamaValidateURL(url) then return end
+        table.insert(YAMA_CFG.Playlist, {title = "Custom Track", artist = "Added", url = url})
+        yamaUpdateUICache()
+        if yamaIsOwner then markPlaylistDirty() end
+        if yamaUI then yamaUI.needsUpdate = true end
+    end)
+
+    net.receive("Yama_Sync_Remove", function()
+        -- Legacy index-based removal path (kept for backwards compatibility if needed).
+        -- The owner now sends Yama_Sync_Remove_URL instead, which all clients handle below.
+        if yamaIsOwner then return end
+        local idx = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+        if YAMA_CFG.Playlist[idx] then
+            table.remove(YAMA_CFG.Playlist, idx)
+            yamaUpdateUICache()
+            if yamaUI then yamaUI.needsUpdate = true end
+        end
+    end)
+
+    net.receive("Yama_Sync_Remove_URL", function()
+        if yamaIsOwner then return end  -- owner already removed it locally in removeTrackGlobal
+        local targetUrl = net.readString()
+        for i = #YAMA_CFG.Playlist, 1, -1 do
+            if YAMA_CFG.Playlist[i].url == targetUrl then
+                table.remove(YAMA_CFG.Playlist, i)
+                yamaUpdateUICache()
+                if yamaUI then yamaUI.needsUpdate = true end
+                break
+            end
+        end
+    end)
+
+    -- Server broadcasts a track title rename to all clients.
+    net.receive("Yama_Sync_Rename", function()
+        local idx   = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+        local title = net.readString()
+        if YAMA_CFG.Playlist[idx] then
+            YAMA_CFG.Playlist[idx].title = title
+            yamaUpdateUICache()
+            if yamaIsOwner then markPlaylistDirty() end
+            if yamaUI then yamaUI.needsUpdate = true end
+        end
+    end)
+
+    -- Server broadcasts an artist rename to all clients.
+    net.receive("Yama_Sync_Artist", function()
+        local idx    = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+        local artist = net.readString()
+        if YAMA_CFG.Playlist[idx] then
+            YAMA_CFG.Playlist[idx].artist = artist
+            yamaUpdateUICache()
+            if yamaIsOwner then markPlaylistDirty() end
+            if yamaUI then yamaUI.needsUpdate = true end
+        end
+    end)
+
+    -- Server relays the !name command back to the owner's client to apply using pendingRenameIdx.
+    net.receive("Yama_Apply_Rename", function()
+        if not yamaIsOwner then return end
+        local newTitle = net.readString()
+        local idx = yamaUI and yamaUI.pendingRenameIdx or 0
+        if idx < 1 or not YAMA_CFG.Playlist[idx] then
+            print("[Music Player] No track selected for rename. Right-click a track first.")
+            return
+        end
+        YAMA_CFG.Playlist[idx].title = newTitle
+        yamaUpdateUICache()
+        markPlaylistDirty()
+        net.start("Yama_Rename_Track")
+        net.writeUInt(idx, YAMA_CFG.TRACK_IDX_BITS)
+        net.writeString(newTitle)
+        net.send()
+        print("[Music Player] Track #" .. idx .. " renamed to: " .. newTitle)
+        yamaUI.pendingRenameIdx = 0
+    end)
+
+    -- Server relays the !artist command back to the owner's client to apply using pendingRenameIdx.
+    net.receive("Yama_Apply_Artist", function()
+        if not yamaIsOwner then return end
+        local newArtist = net.readString()
+        local idx = yamaUI and yamaUI.pendingRenameIdx or 0
+        if idx < 1 or not YAMA_CFG.Playlist[idx] then
+            print("[Music Player] No track selected. Right-click a track first.")
+            return
+        end
+        YAMA_CFG.Playlist[idx].artist = newArtist
+        yamaUpdateUICache()
+        markPlaylistDirty()
+        net.start("Yama_Rename_Artist")
+        net.writeUInt(idx, YAMA_CFG.TRACK_IDX_BITS)
+        net.writeString(newArtist)
+        net.send()
+        print("[Music Player] Track #" .. idx .. " artist set to: " .. newArtist)
+        -- Keep pendingRenameIdx alive so the user can follow up with !name in one session
+    end)
+
+    local function yamaApplyAudio()
+        if not isValid(yamaSnd) then return end
+        
+        local finalVol = (yamaIsOwner and yamaSettings.Vol or 1.0) * curVolMod
+        local finalPitch = (yamaIsOwner and yamaSettings.Pitch or 1.0) * targetPitchMod
+        local finalDist = yamaIsOwner and yamaSettings.Dist or 1500
+
+        if math.abs(lastVol - finalVol) > 0.005 then
+            yamaSnd:setVolume(finalVol)
+            lastVol = finalVol
+        end
+        
+        if math.abs(lastPitch - finalPitch) > 0.005 then
+            yamaSnd:setPitch(finalPitch)
+            lastPitch = finalPitch
+        end
+        
+        if yamaSndIs3D and lastDist ~= finalDist then
+            yamaSnd:setFade(100, finalDist)
+            lastDist = finalDist
+        end
+    end
+
+    local function yamaLoadAudio(resumeAt)
+        local seekCapture = resumeAt or yamaState.time
+        -- Use the packet receipt timestamp if available so elapsed accounts for the full
+        -- round-trip (server write  network  client receive  this call), not just the
+        -- time spent inside yamaLoadAudio itself. Falls back to now if not set.
+        local elapsedBase = yamaState.receivedAt or t_curtime()
+        local loadRequestedAt = t_curtime()
+        yamaLoadID = yamaLoadID + 1
+        local currentLoadID = yamaLoadID
+        yamaStreamReady = false
+
+        -- Headphones mode is owner-only. Default and radio modes are 3D and audible to everyone.
+        local radioActive = isValid(yamaState.radioEnt)
+        if not yamaIsOwner and yamaState.headphones then
+            if isValid(yamaSnd) then yamaSnd:stop() yamaSnd = nil end
+            if isValid(yamaSnd_Precanned) then yamaSnd_Precanned:stop() yamaSnd_Precanned = nil end
+            return
+        end
+
+        if isValid(yamaSnd) then yamaSnd:stop() yamaSnd = nil end
+        if #YAMA_CFG.Playlist == 0 then return end
+        if yamaUI then yamaUI.preCached = false end
+
+        lastVol, lastPitch, lastDist = -1, -1, -1
+        lastRadioPos = Vector(0, 0, 0)
+
+        -- Default: 3D anchored to chip(). Radio: 3D anchored to the radio prop. Headphones: 2D owner-only.
+        local is3D = not yamaState.headphones
+
+        if isValid(yamaSnd_Precanned) and (yamaSnd_PrecannedIs3D ~= is3D) then
+            yamaSnd_Precanned:stop()
+            yamaSnd_Precanned = nil
+        end
+
+        if isValid(yamaSnd_Precanned) then
+            yamaSnd = yamaSnd_Precanned
+            yamaSndIs3D = yamaSnd_PrecannedIs3D
+            yamaSnd_Precanned = nil
+
+            if is3D then
+                local srcEnt = (radioActive and yamaState.radioEnt) or yamaOwner
+                if isValid(srcEnt) then
+                    lastRadioPos = srcEnt:getPos()
+                    yamaSnd:setPos(lastRadioPos)
+                end
+            end
+
+            yamaApplyAudio()
+            local elapsed = t_curtime() - elapsedBase
+            local trackLen = yamaSnd:getLength()
+
+            -- Seek to the synced position accounting for load time.
+            -- Do NOT clamp below trackLen - we want to allow the track to play to the end.
+            local seekTo = trackLen > 0
+                and math.max(0, math.min(seekCapture + elapsed, trackLen))
+                or  0
+            if trackLen > 0 and not yamaSnd:isBlockStreamed() then yamaSnd:setTime(seekTo) end
+            if not yamaState.playing then yamaSnd:pause() else yamaSnd:play() end
+            yamaStreamReady = true
+
+                    if yamaIsOwner then
+                    local capturedID = yamaLoadID
+                    timer.simple(2, function()
+                        if yamaLoadID ~= capturedID then return end
+                        if not isValid(yamaSnd) then return end
+                        local finalLen = yamaSnd:getLength()
+                        if finalLen > 10 then
+                            -- Report realLen + DURATION_GUARD so the server fires only after
+                            -- the track has truly finished playing.
+                            net.start("Yama_Report_Length")
+                            net.writeFloat(finalLen + YAMA_CFG.DURATION_GUARD)
+                            net.send()
+                        end
+                    end)
+                end
+            return
+        end
+
+        -- Load fresh stream if no pre-cache is available.
+        local track = YAMA_CFG.Playlist[yamaState.trackIdx]
+        if not track or not yamaValidateURL(track.url) then return end
+
+        local flags = is3D and "3d noblock" or "noblock"
+
+        pcall(function()
+            bass.loadURL(track.url, flags, function(audio)
+                if not audio or currentLoadID ~= yamaLoadID then if audio then audio:stop() end return end
+                yamaSnd = audio
+                yamaSndIs3D = is3D
+
+                if is3D then
+                    local srcEnt = (radioActive and yamaState.radioEnt) or yamaOwner
+                    if isValid(srcEnt) then
+                        lastRadioPos = srcEnt:getPos()
+                        yamaSnd:setPos(lastRadioPos)
+                    end
+                end
+
+                yamaApplyAudio()
+                local elapsed  = t_curtime() - elapsedBase
+                local trackLen = yamaSnd:getLength()
+                -- Do NOT clamp below trackLen - we want to allow the track to play to the end.
+                local seekTo = trackLen > 0
+                    and math.max(0, math.min(seekCapture + elapsed, trackLen))
+                    or  0
+                if trackLen > 0 and not yamaSnd:isBlockStreamed() then yamaSnd:setTime(seekTo) end
+                if not yamaState.playing then yamaSnd:pause() else yamaSnd:play() end
+                yamaStreamReady = true
+
+                    if yamaIsOwner then
+                    local capturedID = yamaLoadID
+                    local maxReported = 0
+                    
+                    timer.create("Yama_Length_Poll", 1, 0, function()
+                        -- Kill the timer if the track changes or the sound object is destroyed
+                        if yamaLoadID ~= capturedID or not isValid(yamaSnd) then 
+                            timer.remove("Yama_Length_Poll") 
+                            return 
+                        end
+                        
+                        local curLen = yamaSnd:getLength()
+                        
+                        -- If the BASS buffer expands the known length by more than 1 second, update the server
+                        if curLen > 10 and curLen > maxReported + 1.0 then
+                            maxReported = curLen
+                            net.start("Yama_Report_Length")
+                            net.writeFloat(curLen + YAMA_CFG.DURATION_GUARD)
+                            net.send()
+                        end
+                    end)
+                end
+            end)
+        end)
+    end
+
+    net.receive("Yama_Music_Sync", function()
+        local n_receivedAt = t_curtime()  -- capture before any processing
+        local n_playing  = net.readBool()
+        local n_looping  = net.readBool()
+        local n_shuffle  = net.readBool()
+        local n_autoplay = net.readBool()
+        local n_idx      = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+        local n_nextIdx  = net.readUInt(YAMA_CFG.TRACK_IDX_BITS)
+        local hasRadio   = net.readBool()
+        local n_ent      = hasRadio and net.readEntity() or nil
+        local n_hp       = net.readBool()
+        local n_time     = net.readFloat()
+
+        if type(n_time) ~= "number" or n_time < 0 then return end
+        if n_idx < 1 or n_idx > #YAMA_CFG.Playlist then return end
+
+        local radioChanged = (n_ent ~= yamaState.radioEnt)
+        local modeSwitch   = (n_hp ~= yamaState.headphones) or radioChanged
+        local trackChanged = (n_idx ~= yamaState.trackIdx)
+
+        yamaState.playing      = n_playing
+        yamaState.looping      = n_looping
+        yamaState.shuffle      = n_shuffle
+        yamaState.autoplay     = n_autoplay
+        yamaState.trackIdx     = n_idx
+        yamaState.nextTrackIdx = n_nextIdx
+        yamaState.radioEnt     = n_ent
+        yamaState.headphones   = n_hp
+        yamaState.time         = n_time
+        yamaState.receivedAt   = n_receivedAt  -- used by yamaLoadAudio to improve seek accuracy
+
+        if trackChanged then yamaUpdateUICache() end
+        if yamaUI then yamaUI.needsUpdate = true end
+
+        if trackChanged or modeSwitch then
+
+            if isValid(yamaSnd) then yamaSnd:stop() yamaSnd = nil end
+            yamaLoadAudio()
+        else
+            if isValid(yamaSnd) then
+                if yamaState.playing then yamaSnd:play() else yamaSnd:pause() end
+
+                if not yamaIsOwner and yamaStreamReady then
+                    local streamTime = yamaSnd:getTime()
+                    local len = yamaSnd:getLength()
+                    if len > 0 and math.abs(n_time - streamTime) > 2.0 and not yamaSnd:isBlockStreamed() then
+                        yamaSnd:setTime(n_time)
+                    end
+                end
+            elseif yamaState.playing then
+                yamaLoadAudio()
+            end
+        end
+    end)
+
+    local function yamaSendAction(action, val, isUInt)
+        net.start("Yama_Music_Control")
+        net.writeString(action)
+        if val ~= nil then
+            if isUInt then
+                net.writeUInt(val, YAMA_CFG.TRACK_IDX_BITS)
+            else
+                net.writeFloat(val)
+            end
+        end
+        net.send()
+    end
+
+    local nextMuffleTrace = 0
+    local yamaLastStreamTime = -1
+    local yamaStreamStallTime = 0
+
+    hook.add("Think", "YamaAudioPos", function()
+        if isValid(yamaSnd) and yamaState.playing then
+            local len = yamaSnd:getLength()
+            local cur = yamaSnd:getTime()
+
+            -- HARDCODED INJECT: Monitor physical audio cursor
+            if yamaIsOwner then
+                if cur ~= yamaLastStreamTime then
+                    yamaLastStreamTime = cur
+                    yamaStreamStallTime = t_curtime()
+                elseif t_curtime() - yamaStreamStallTime > 2.0 then
+                    -- The stream cursor has not moved in 2 seconds. Audio is 100% dead.
+                    yamaSendAction("TRACK_END")
+                    yamaStreamStallTime = t_curtime() + 10 -- Debounce to prevent spam
+                end
+            end
+            
+            -- Quota-aware degradation: scale back expensive operations under CPU pressure.
+            local quotaFrac = quotaUsed() / quotaMax()
+            local overBudget = quotaFrac > 0.60  -- skip FFT above 60%
+            local highLoad   = quotaFrac > 0.75  -- widen muffle trace above 75%
+            yamaQuotaOverBudget = overBudget
+            
+            if len > 0 and cur >= len - YAMA_CFG.PRECACHE_LEAD and not (yamaUI and yamaUI.preCached) and #YAMA_CFG.Playlist > 1 then
+                local nextUrl = YAMA_CFG.Playlist[yamaState.nextTrackIdx] and YAMA_CFG.Playlist[yamaState.nextTrackIdx].url
+                
+                if nextUrl and yamaValidateURL(nextUrl) then
+                    if isValid(yamaSnd_Precanned) then
+                        yamaSnd_Precanned:stop()
+                        yamaSnd_Precanned = nil
+                    end
+                    local is3D = not yamaState.headphones
+                    local flags = is3D and "3d noblock" or "noblock"
+                    if not yamaIsOwner and not is3D then return end  -- non-owners skip pre-cache only in headphones mode
+                    local pID = yamaLoadID
+                    
+                    pcall(function()
+                        bass.loadURL(nextUrl, flags, function(audio)
+                            if pID ~= yamaLoadID then if audio then audio:stop() end return end
+                            yamaSnd_Precanned = audio
+                            yamaSnd_PrecannedIs3D = is3D
+                            if isValid(yamaSnd_Precanned) then yamaSnd_Precanned:pause() end
+                        end)
+                    end)
+                end
+                if yamaUI then yamaUI.preCached = true end
+            end
+
+            if not yamaState.headphones then
+                local srcEnt = (isValid(yamaState.radioEnt) and yamaState.radioEnt) or yamaOwner
+                local rPos = isValid(srcEnt) and srcEnt:getPos()
+                local eyePos = player():getEyePos()
+
+                if rPos and eyePos then
+
+                    if yamaSndIs3D and (rPos - lastRadioPos):getLengthSqr() > 1 then
+                        yamaSnd:setPos(rPos)
+                        lastRadioPos = rPos
+                    end
+
+                    if yamaSettings.Muffle then
+                        if t_curtime() > nextMuffleTrace then
+                            local ok, tr = pcall(trace.line, eyePos, rPos, {player(), srcEnt}, MASK_SOLID)
+                            if ok and tr then
+                                targetVolMod  = tr.Hit and 0.4 or 1.0
+                                targetPitchMod = tr.Hit and 0.95 or 1.0
+                            end
+                            nextMuffleTrace = t_curtime() + (highLoad and YAMA_CFG.MUFFLE_INTERVAL * 3 or YAMA_CFG.MUFFLE_INTERVAL)
+                        end
+                    else
+                        targetVolMod, targetPitchMod = 1.0, 1.0
+                    end
+                else
+                    targetVolMod, targetPitchMod = 1.0, 1.0
+                end
+            else
+                targetVolMod, targetPitchMod = 1.0, 1.0
+            end
+
+            local halfLife = 0.15
+            local dt = t_frametime()
+            local alpha = math.exp(-dt / halfLife)
+            curVolMod = targetVolMod + (curVolMod - targetVolMod) * alpha
+            yamaApplyAudio()
+        end
+    end)
+
+    if yamaIsOwner then
+        enableHud(player(), true)
+        
+        local fontTitle = render.createFont("Roboto", 22, 800, true)
+        local fontSub = render.createFont("Roboto", 16, 600, true)
+        local fontBtn = render.createFont("Roboto", 14, 800, true)
+
+        yamaUI = {
+            open = false, settingsOpen = false, queueOpen = false,
+            visMode = 1, draggingSeek = false, activeSlider = nil,
+            seekFrac = 0, targetSeekFrac = 0, needsUpdate = true, waitingForKey = false, preCached = false,
+            rtName = "YamaModernRTV7", clickables = {}, rightClickables = {}, nextFFT = 0,
+            closeFlash = false, sliderX = 0, sliderW = 100, startMX = 0, startScale = 1.0,
+            dM = Matrix(), polyLine = {},
+            queuePage = 0,
+            pendingRenameIdx = 0   -- track index awaiting a !name <text> chat command
+        }
+        for i = 1, 32 do yamaUI.polyLine[i] = {x = 0, y = 0} end
+
+        render.createRenderTarget(yamaUI.rtName, 1024, 1024)
+        yamaUI.rtSize = 1024
+        yamaUI.rtMat = material.create("UnlitGeneric")
+        yamaUI.rtMat:setInt("$translucent", 1)
+        yamaUI.rtMat:setInt("$vertexalpha", 1) 
+        yamaUI.rtMat:setInt("$vertexcolor", 1) 
+        yamaUI.rtMat:setTextureRenderTarget("$basetexture", yamaUI.rtName)
+        
+        local yamaHUDHide = {}
+        hook.add("HUDShouldDraw", "YamaHideCrosshair", function(name)
+            if not yamaUI.open then return end
+            if yamaHUDHide[name] == nil then
+                local lowerName = string.lower(name)
+                yamaHUDHide[name] = (string.find(lowerName, "crosshair") or string.find(lowerName, "reticle") or string.find(lowerName, "aim")) and true or false
+            end
+            if yamaHUDHide[name] then return false end
+        end)
+
+        local function yamaGetPanelGeom(sw, sh)
+            local px = m_floor((sw - YAMA_CFG.UI_Width) / 2)
+            local py = m_floor((sh - YAMA_CFG.UI_Height) / 2)
+            return px, py, YAMA_CFG.UI_Width, YAMA_CFG.UI_Height
+        end
+
+        local function registerHitbox(id, x, y, w, h, cb)
+            table.insert(yamaUI.clickables, {x=x, y=y, w=w, h=h, cb=cb})
+        end
+
+        local function registerRightHitbox(id, x, y, w, h, cb)
+            table.insert(yamaUI.rightClickables, {x=x, y=y, w=w, h=h, cb=cb})
+        end
+
+        local yamaLastClickTime = 0  
+
+        hook.add("inputPressed", "YamaUIInput", function(k)
+            if yamaUI.waitingForKey then
+                YAMA_CFG.UI_KeyBind = k
+                yamaUI.waitingForKey = false
+                yamaUI.needsUpdate = true
+                markSettingsDirty()
+                return
+            end
+
+            if k == YAMA_CFG.UI_KeyBind then
+                yamaUI.open = not yamaUI.open
+                input.enableCursor(yamaUI.open)
+                return
+            end
+
+            if not yamaUI.open then return end
+
+            --  Left mouse button 
+            if k == YAMA_CFG.MOUSE_LEFT then
+                local now = t_curtime()
+                local mx, my = input.getCursorPos()
+                local sw, sh = render.getGameResolution()
+                local rawPX, rawPY, pw, ph = yamaGetPanelGeom(sw, sh)
+
+                local scaledW, scaledH = pw * YAMA_CFG.UI_Scale, ph * YAMA_CFG.UI_Scale
+                local drawX, drawY = (sw - scaledW) / 2, (sh - scaledH) / 2
+
+                local localMX = rawPX + ((mx - drawX) / YAMA_CFG.UI_Scale)
+                local localMY = rawPY + ((my - drawY) / YAMA_CFG.UI_Scale)
+
+                local seekY = rawPY + YAMA_CFG.SEEK_BAR_Y
+                if localMX >= rawPX + 10 and localMX <= rawPX + pw - 10
+                and localMY >= seekY - 5  and localMY <= seekY + 15 then
+                    if isValid(yamaSnd) and yamaSnd:getLength() > 0 then
+                        yamaUI.draggingSeek = true
+                    end
+                    return
+                end
+
+                for _, hb in ipairs(yamaUI.clickables) do
+                    if localMX >= hb.x and localMX <= hb.x + hb.w and localMY >= hb.y and localMY <= hb.y + hb.h then
+                        if now - yamaLastClickTime < 0.1 then return end
+                        yamaLastClickTime = now
+                        if hb.cb then hb.cb() end
+                        return
+                    end
+                end
+            end
+
+            --  Right mouse button 
+            if k == YAMA_CFG.MOUSE_RIGHT then
+                if not yamaUI.queueOpen then return end
+                local mx, my = input.getCursorPos()
+                local sw, sh = render.getGameResolution()
+                local rawPX, rawPY, pw, ph = yamaGetPanelGeom(sw, sh)
+                local scaledW = pw * YAMA_CFG.UI_Scale
+                local drawX = (sw - scaledW) / 2
+                local drawY = (sh - ph * YAMA_CFG.UI_Scale) / 2
+                local localMX = rawPX + ((mx - drawX) / YAMA_CFG.UI_Scale)
+                local localMY = rawPY + ((my - drawY) / YAMA_CFG.UI_Scale)
+
+                for _, hb in ipairs(yamaUI.rightClickables) do
+                    if localMX >= hb.x and localMX <= hb.x + hb.w and localMY >= hb.y and localMY <= hb.y + hb.h then
+                        if hb.cb then hb.cb() end
+                        return
+                    end
+                end
+            end
+        end)
+
+        hook.add("inputReleased", "YamaUIInputRel", function(k)
+            if k == YAMA_CFG.MOUSE_LEFT then
+                if yamaUI.draggingSeek then
+                    yamaUI.draggingSeek = false
+                    if isValid(yamaSnd) then
+                        local len = yamaSnd:getLength()
+                        if len > 0 then
+                            local targetT = yamaUI.targetSeekFrac * len
+                            if not yamaSnd:isBlockStreamed() then
+                                yamaSnd:setTime(targetT)
+                            end
+                            yamaSendAction("SEEK", targetT)
+                            yamaState.time = targetT
+                        end
+                    end
+                end
+
+                if yamaUI.activeSlider then
+                    yamaUI.activeSlider = nil
+                    markSettingsDirty()
+                end
+            end
+        end)
+
+        local sliderSetters = {
+            scale = function(_, rawMX)
+                local rawDelta = (rawMX - yamaUI.startMX) / 200
+                YAMA_CFG.UI_Scale = m_clamp(yamaUI.startScale + rawDelta, 0.5, 2.0)
+            end,
+            vol   = function(f) yamaSettings.Vol   = f * 5 end,
+            dist  = function(f) yamaSettings.Dist  = 100 + (f * 2400) end,
+            pitch = function(f) yamaSettings.Pitch = 0.1 + (f * 2.9) end,
+            r   = function(f) YAMA_CFG.Colors.Accent.r  = m_floor(f * 255) end,
+            g   = function(f) YAMA_CFG.Colors.Accent.g  = m_floor(f * 255) end,
+            b   = function(f) YAMA_CFG.Colors.Accent.b  = m_floor(f * 255) end,
+            vtr = function(f) YAMA_CFG.Colors.VisTop.r  = m_floor(f * 255) end,
+            vtg = function(f) YAMA_CFG.Colors.VisTop.g  = m_floor(f * 255) end,
+            vtb = function(f) YAMA_CFG.Colors.VisTop.b  = m_floor(f * 255) end,
+            vbr = function(f) YAMA_CFG.Colors.VisBot.r  = m_floor(f * 255) end,
+            vbg = function(f) YAMA_CFG.Colors.VisBot.g  = m_floor(f * 255) end,
+            vbb = function(f) YAMA_CFG.Colors.VisBot.b  = m_floor(f * 255) end,
+        }
+
+        hook.add("Think", "YamaUIDrag", function()
+            if not yamaUI.open then return end
+            local mx, my = input.getCursorPos()
+            local sw, sh = render.getGameResolution()
+            local rawPX, rawPY, pw, ph = yamaGetPanelGeom(sw, sh)
+
+            local scaledW = pw * YAMA_CFG.UI_Scale
+            local drawX = (sw - scaledW) / 2
+            local localMX = rawPX + ((mx - drawX) / YAMA_CFG.UI_Scale)
+
+            if yamaUI.draggingSeek then
+                local seekX, seekW = rawPX + 10, pw - 20
+                yamaUI.targetSeekFrac = m_clamp((localMX - seekX) / seekW, 0, 1)
+                yamaUI.seekFrac = m_approach(yamaUI.seekFrac, yamaUI.targetSeekFrac, t_frametime() * 3)
+            end
+
+            if yamaUI.activeSlider then
+                local setter = sliderSetters[yamaUI.activeSlider]
+                if setter then
+                    if yamaUI.activeSlider == "scale" then
+                        setter(nil, mx)
+                    else
+                        local frac = m_clamp((localMX - yamaUI.sliderX) / yamaUI.sliderW, 0, 1)
+                        setter(frac)
+                    end
+                end
+                yamaUI.needsUpdate = true
+            end
+        end)
+
+        local function yamaFormatTime(seconds)
+            local h = m_floor(seconds / 3600)
+            local m = m_floor((seconds % 3600) / 60)
+            local s = m_floor(seconds % 60)
+            if h > 0 then
+                return string.format("%d:%02d:%02d", h, m, s)
+            end
+            return string.format("%02d:%02d", m, s)
+        end
+
+        local function drawModernBtn(x, y, w, h, txt, active, cb)
+            render.setColor(active and YAMA_CFG.Colors.Accent or YAMA_CFG.Colors.BG_Input)
+            render.drawRoundedBox(4, x, y, w, h)
+            render.setFont(fontBtn)
+            render.setColor(active and Color(255,255,255) or YAMA_CFG.Colors.TextPrimary)
+            render.drawSimpleText(x + w/2, y + h/2, txt, 1, 1)
+            if cb then registerHitbox("btn", x, y, w, h, cb) end
+        end
+
+        local function yamaUpdateRT(sw, sh, px, py, pw, ph)
+            yamaUI.clickables = {}
+            yamaUI.rightClickables = {}
+            render.selectRenderTarget(yamaUI.rtName)
+            render.clear(Color(0, 0, 0, 0))
+            
+            local m = Matrix()
+            m:setTranslation(Vector(-px, -py, 0))
+            render.pushMatrix(m, true)
+
+            render.setColor(YAMA_CFG.Colors.BG_Main)
+            render.drawRoundedBox(8, px, py, pw, ph)
+            
+            drawModernBtn(px + 10, py + 10, 100, 35, "Settings", yamaUI.settingsOpen, function()
+                yamaUI.settingsOpen = not yamaUI.settingsOpen
+                yamaUI.queueOpen = false
+                yamaUI.needsUpdate = true
+            end)
+            
+            local bannerW = pw - 180
+            render.setColor(YAMA_CFG.Colors.BG_Input)
+            render.drawRoundedBox(4, px + 120, py + 10, bannerW, 35)
+            
+            render.setFont(fontSub)
+            render.setColor(YAMA_CFG.Colors.TextPrimary)
+            render.drawSimpleText(px + 120 + bannerW/2, py + 27, "Click to add/remove a track via chat", 1, 1)
+
+            registerHitbox("banner_close", px + 120, py + 10, bannerW, 35, function()
+                yamaUI.open = false
+                input.enableCursor(false)
+                print("[Music Player] Type !addmusic <URL> or !removemusic <URL> in chat.")
+            end)
+
+            local isFlashing = yamaUI.closeFlash
+            render.setColor(isFlashing and Color(200, 50, 50) or YAMA_CFG.Colors.BG_Input)
+            render.drawRoundedBox(4, px + pw - 45, py + 10, 35, 35)
+            
+            render.setFont(fontBtn)
+            render.setColor(isFlashing and Color(255, 255, 255) or YAMA_CFG.Colors.TextPrimary)
+            render.drawSimpleText(px + pw - 27, py + 27, "X", 1, 1)
+
+            registerHitbox("close_x", px + pw - 45, py + 10, 35, 35, function()
+                if yamaUI.closeFlash then return end 
+                yamaUI.closeFlash = true
+                yamaUI.needsUpdate = true
+                
+                timer.simple(0.15, function()
+                    yamaUI.closeFlash = false
+                    yamaUI.open = false
+                    input.enableCursor(false)
+                end)
+            end)
+
+            if yamaUI.settingsOpen then
+                render.setColor(YAMA_CFG.Colors.BG_Input)
+                render.drawRoundedBox(8, px + 10, py + 60, pw - 20, 270)
+                render.setFont(fontTitle)
+                render.setColor(YAMA_CFG.Colors.Accent)
+                render.drawSimpleText(px + pw/2, py + 85, "AUDIO & THEME SETTINGS", 1, 1)
+
+                local labels = {"VOL", "DIST", "PITCH", "SCALE"}
+                local sX = px + 100
+                local fracs = {
+                    yamaSettings.Vol / 5, (yamaSettings.Dist - 100) / 2400,
+                    (yamaSettings.Pitch - 0.1) / 2.9, (YAMA_CFG.UI_Scale - 0.5) / 1.5
+                }
+                local vals = {
+                    string.format("%.1f", yamaSettings.Vol), m_floor(yamaSettings.Dist).."u",
+                    string.format("%.2fx", yamaSettings.Pitch), string.format("%.2fx", YAMA_CFG.UI_Scale)
+                }
+                local ids = {"vol", "dist", "pitch", "scale"}
+
+                for i, l in ipairs(labels) do
+                    local dx, dy = sX, py + 120 + ((i - 1) * 35)
+                    local tW = 220
+                    render.setFont(fontSub)
+                    render.setColor(YAMA_CFG.Colors.TextPrimary)
+                    render.drawSimpleText(dx - 50, dy, l, 0, 1)
+                    render.setColor(Color(10, 10, 10))
+                    render.drawRoundedBox(4, dx, dy - 6, tW, 12)
+                    render.setColor(YAMA_CFG.Colors.Accent)
+                    render.drawRoundedBox(4, dx, dy - 6, tW * fracs[i], 12)
+                    render.setColor(YAMA_CFG.Colors.TextDim)
+                    render.drawSimpleText(dx + tW + 10, dy, vals[i], 0, 1)
+                    
+                    registerHitbox(ids[i], dx, dy - 10, tW, 20, function()
+                        yamaUI.activeSlider = ids[i]
+                        yamaUI.sliderX = dx
+                        yamaUI.sliderW = tW
+                        local startMX, _ = input.getCursorPos()
+                        yamaUI.startMX = startMX
+                        yamaUI.startScale = YAMA_CFG.UI_Scale
+                    end)
+                end
+
+                local colorGroups = {
+                    { label = "ACCENT",  labelColor = YAMA_CFG.Colors.Accent,
+                      rows = {
+                        { id = "r", name = "R", frac = YAMA_CFG.Colors.Accent.r / 255, val = YAMA_CFG.Colors.Accent.r, barCol = Color(220, 60, 60) },
+                        { id = "g", name = "G", frac = YAMA_CFG.Colors.Accent.g / 255, val = YAMA_CFG.Colors.Accent.g, barCol = Color(60, 200, 60) },
+                        { id = "b", name = "B", frac = YAMA_CFG.Colors.Accent.b / 255, val = YAMA_CFG.Colors.Accent.b, barCol = Color(60, 100, 220) },
+                      }
+                    },
+                    { label = "VIS TOP", labelColor = YAMA_CFG.Colors.VisTop,
+                      rows = {
+                        { id = "vtr", name = "R", frac = YAMA_CFG.Colors.VisTop.r / 255, val = YAMA_CFG.Colors.VisTop.r, barCol = Color(220, 60, 60) },
+                        { id = "vtg", name = "G", frac = YAMA_CFG.Colors.VisTop.g / 255, val = YAMA_CFG.Colors.VisTop.g, barCol = Color(60, 200, 60) },
+                        { id = "vtb", name = "B", frac = YAMA_CFG.Colors.VisTop.b / 255, val = YAMA_CFG.Colors.VisTop.b, barCol = Color(60, 100, 220) },
+                      }
+                    },
+                    { label = "VIS BOT", labelColor = YAMA_CFG.Colors.VisBot,
+                      rows = {
+                        { id = "vbr", name = "R", frac = YAMA_CFG.Colors.VisBot.r / 255, val = YAMA_CFG.Colors.VisBot.r, barCol = Color(220, 60, 60) },
+                        { id = "vbg", name = "G", frac = YAMA_CFG.Colors.VisBot.g / 255, val = YAMA_CFG.Colors.VisBot.g, barCol = Color(60, 200, 60) },
+                        { id = "vbb", name = "B", frac = YAMA_CFG.Colors.VisBot.b / 255, val = YAMA_CFG.Colors.VisBot.b, barCol = Color(60, 100, 220) },
+                      }
+                    },
+                }
+
+                local colW = (pw - 40) / 3
+                local slW  = colW - 50
+                local startY = py + 240
+                local rowH = 22
+
+                for ci, group in ipairs(colorGroups) do
+                    local colX = px + 20 + (ci - 1) * colW
+
+                    render.setFont(fontBtn)
+                    render.setColor(group.labelColor)
+                    render.drawSimpleText(colX + slW / 2, startY, group.label, 1, 1)
+                    render.setColor(group.labelColor)
+                    render.drawRoundedBox(2, colX + slW / 2 + 38, startY - 7, 11, 11)
+
+                    for ri, row in ipairs(group.rows) do
+                        local dy = startY + ri * rowH
+                        render.setFont(fontSub)
+                        render.setColor(YAMA_CFG.Colors.TextPrimary)
+                        render.drawSimpleText(colX, dy, row.name, 0, 1)
+                        render.setColor(Color(10, 10, 10))
+                        render.drawRoundedBox(4, colX + 12, dy - 5, slW, 10)
+                        render.setColor(row.barCol)
+                        render.drawRoundedBox(4, colX + 12, dy - 5, slW * row.frac, 10)
+                        render.setColor(YAMA_CFG.Colors.TextDim)
+                        render.drawSimpleText(colX + 12 + slW + 6, dy, row.val, 0, 1)
+                        
+                        local capturedId = row.id
+                        registerHitbox(capturedId, colX + 12, dy - 8, slW, 16, function()
+                            yamaUI.activeSlider = capturedId
+                            yamaUI.sliderX = colX + 12
+                            yamaUI.sliderW = slW
+                            local startMX, _ = input.getCursorPos()
+                            yamaUI.startMX = startMX
+                            yamaUI.startScale = YAMA_CFG.UI_Scale
+                        end)
+                    end
+                end
+
+                drawModernBtn(px + 40, py + 342, 140, 25, "Muffle: " .. tostring(yamaSettings.Muffle), yamaSettings.Muffle, function()
+                    yamaSettings.Muffle = not yamaSettings.Muffle
+                    yamaUI.needsUpdate = true
+                    markSettingsDirty()
+                end)
+                drawModernBtn(px + 190, py + 342, 140, 25, "Autoplay: " .. tostring(yamaState.autoplay), yamaState.autoplay, function()
+                    yamaSendAction("AUTOPLAY")
+                end)
+                
+                local kbText = yamaUI.waitingForKey and "Press any key..." or ("Keybind: " .. (input.getKeyName(YAMA_CFG.UI_KeyBind) or "?"))
+                drawModernBtn(px + pw - 250, py + 342, 200, 25, kbText, yamaUI.waitingForKey, function()
+                    yamaUI.waitingForKey = true
+                    yamaUI.needsUpdate = true
+                end)
+
+            elseif yamaUI.queueOpen then
+                local totalTracks = #YAMA_CFG.Playlist
+                local pageSize    = YAMA_CFG.QUEUE_VISIBLE
+                local totalPages  = math.max(1, math.ceil(totalTracks / pageSize))
+
+                yamaUI.queuePage = math.min(yamaUI.queuePage, totalPages - 1)
+                local pageStart   = yamaUI.queuePage * pageSize + 1
+
+                local panelH = 50 + pageSize * 35 + 28 + 12
+                render.setColor(YAMA_CFG.Colors.BG_Input)
+                render.drawRoundedBox(8, px + 10, py + 60, pw - 20, panelH)
+                render.setFont(fontTitle)
+                render.setColor(YAMA_CFG.Colors.Accent)
+                render.drawSimpleText(px + pw/2, py + 85, "PLAYLIST QUEUE", 1, 1)
+
+                -- Hint text: right-click to rename via chat
+                render.setFont(fontSub)
+                render.setColor(YAMA_CFG.Colors.TextDim)
+                render.drawSimpleText(px + pw - 30, py + 85, "RMB: !name / !artist", 2, 1)
+
+                local playY, trackH = py + 110, 35
+                for slot = 0, pageSize - 1 do
+                    local i = pageStart + slot
+                    if i > totalTracks then break end
+                    local t      = YAMA_CFG.Playlist[i]
+                    local active = (i == yamaState.trackIdx)
+                    local rowY   = playY + slot * trackH
+
+                    -- Row highlight for active track
+                    if active then
+                        render.setColor(Color(255, 255, 255, 10))
+                        render.drawRoundedBox(4, px + 20, rowY, pw - 40, 30)
+                    end
+
+                    render.setFont(fontSub)
+                    render.setColor(active and YAMA_CFG.Colors.Accent or YAMA_CFG.Colors.TextPrimary)
+
+                    -- Track number is always the playlist position (i), not a stored field.
+                    -- Always show: "#. Artist - Title"
+                    local maxChars = math.floor((pw - 80) / 8)
+                    local artist = (t.artist and t.artist ~= "") and t.artist or "Unknown"
+                    local label = string.format("%d. %s - %s", i, artist, t.title)
+                    if #label > maxChars then label = string.sub(label, 1, maxChars - 1) .. "" end
+                    render.drawSimpleText(px + 30, rowY + 15, label, 0, 1)
+
+                    -- Left-click row  jump to track
+                    local capturedIdx = i
+                    local rowX = px + 20
+                    local rowW = pw - 40 - 35  -- leave room for X button
+                    registerHitbox("row_" .. i, rowX, rowY, rowW, 30, function()
+                        yamaSendAction("JUMPTO", capturedIdx, true)
+                        yamaUI.needsUpdate = true
+                    end)
+
+                    -- Right-click row  close UI and prompt chat rename command
+                    registerRightHitbox("rename_" .. i, rowX, rowY, rowW, 30, function()
+                        if not YAMA_CFG.Playlist[capturedIdx] then return end
+                        yamaUI.pendingRenameIdx = capturedIdx
+                        -- Close the player UI so the chat can be opened
+                        yamaUI.open = false
+                        yamaUI.queueOpen = false
+                        input.enableCursor(false)
+                        -- Inform the player what to type
+                        print("[Music Player] Track #" .. capturedIdx .. " (" .. YAMA_CFG.Playlist[capturedIdx].title .. ") selected. Type !name <Title> or !artist <Artist> in chat.")
+                        yamaUI.needsUpdate = true
+                    end)
+
+                    -- X button  remove track
+                    drawModernBtn(px + pw - 50, rowY + 5, 25, 20, "X", false, function()
+                        removeTrackGlobal(capturedIdx); yamaUI.needsUpdate = true
+                    end)
+                end
+
+                if totalPages > 1 then
+                    local pagRowY = playY + pageSize * trackH + 4
+                    drawModernBtn(px + 20, pagRowY, 25, 20, "<", false, function()
+                        yamaUI.queuePage = (yamaUI.queuePage - 1 + totalPages) % totalPages
+                        yamaUI.needsUpdate = true
+                    end)
+                    render.setFont(fontSub)
+                    render.setColor(YAMA_CFG.Colors.TextDim)
+                    render.drawSimpleText(px + pw/2, pagRowY + 10,
+                        string.format("%d / %d", yamaUI.queuePage + 1, totalPages), 1, 1)
+                    drawModernBtn(px + pw - 45, pagRowY, 25, 20, ">", false, function()
+                        yamaUI.queuePage = (yamaUI.queuePage + 1) % totalPages
+                        yamaUI.needsUpdate = true
+                    end)
+                end
+
+            end  -- elseif yamaUI.queueOpen
+
+            -- SEEK_BAR_Y lives in YAMA_CFG.SEEK_BAR_Y; referenced here and in drawHUD.
+            local seekY = py + YAMA_CFG.SEEK_BAR_Y
+            render.setColor(Color(10,10,10,255))
+            render.drawRoundedBox(4, px + 10, seekY, pw - 20, 12)
+
+            local by = py + 440
+            drawModernBtn(px + 10, by, 120, 30, "Headphones", yamaState.headphones, function() yamaSendAction("HEADPHONES") end)
+            drawModernBtn(px + 140, by, 120, 30, "Music Queue", yamaUI.queueOpen, function()
+                yamaUI.queueOpen = not yamaUI.queueOpen
+                yamaUI.needsUpdate = true
+            end)
+            drawModernBtn(px + 10, by + 40, 120, 30, "Radio", isValid(yamaState.radioEnt), function() yamaSendAction("RADIO") end)
+            drawModernBtn(px + 140, by + 40, 120, 30, "Vis Mode", false, function() yamaUI.visMode = yamaUI.visMode == 1 and 2 or 1; yamaUI.needsUpdate = true end)
+
+            local cx = px + pw/2
+            drawModernBtn(cx - 90, by, 50, 50, "|<", false, function() yamaSendAction("PREV") end)
+            
+            render.setColor(YAMA_CFG.Colors.Accent)
+            render.drawRoundedBox(12, cx - 30, by - 5, 60, 60)
+            render.setColor(Color(255,255,255))
+            render.drawSimpleText(cx, by + 25, yamaState.playing and "||" or ">", 1, 1)
+            registerHitbox("play", cx - 30, by - 5, 60, 60, function() yamaSendAction("PLAYPAUSE"); yamaUI.needsUpdate = true end)
+
+            drawModernBtn(cx + 40, by, 50, 50, ">|", false, function() yamaSendAction("NEXT") end)
+
+            drawModernBtn(px + pw - 160, by, 150, 30, "Shuffle", yamaState.shuffle, function() yamaSendAction("SHUFFLE"); yamaUI.needsUpdate = true end)
+            drawModernBtn(px + pw - 160, by + 40, 150, 30, "Loop Current", yamaState.looping, function() yamaSendAction("LOOP"); yamaUI.needsUpdate = true end)
+
+            render.popMatrix()
+            render.selectRenderTarget()
+            yamaUI.needsUpdate = false
+        end
+
+        hook.add("drawHUD", "YamaDrawWinamp", function()
+            if not yamaUI.open then return end
+            local sw, sh = render.getGameResolution()
+            local rawPX, rawPY, pw, ph = yamaGetPanelGeom(sw, sh)
+            
+            if yamaUI.needsUpdate then 
+                yamaUpdateRT(sw, sh, rawPX, rawPY, pw, ph) 
+            end
+
+            local scaledW, scaledH = pw * YAMA_CFG.UI_Scale, ph * YAMA_CFG.UI_Scale
+            local drawX, drawY = (sw - scaledW) / 2, (sh - scaledH) / 2
+
+            render.setMaterial(yamaUI.rtMat)
+            render.setRGBA(255, 255, 255, 255)
+            render.drawTexturedRectUV(drawX, drawY, scaledW, scaledH, 0, 0, pw / yamaUI.rtSize, ph / yamaUI.rtSize)
+
+            yamaUI.dM:setTranslation(Vector(drawX, drawY, 0))
+            yamaUI.dM:setScale(Vector(YAMA_CFG.UI_Scale, YAMA_CFG.UI_Scale, 1))
+            render.pushMatrix(yamaUI.dM, true)
+
+            local dX, dY = 0, 0 
+
+            if not yamaUI.settingsOpen and not yamaUI.queueOpen then
+                if isValid(yamaSnd) and yamaState.playing then
+                    if not yamaQuotaOverBudget and t_curtime() > yamaUI.nextFFT then
+                        yamaFFT = yamaSnd:getFFT(0)
+                        yamaUI.nextFFT = t_curtime() + 0.03
+                    end
+                else
+                    for i = 1, 32 do yamaFFT[i] = 0 end
+                end
+
+                local ft = t_frametime()
+                local visX, visY, visW, visH = dX + 10, dY + 130, pw - 20, 180
+                
+                if yamaUI.visMode == 1 then
+                    local barW = visW / 32
+                    for i = 1, 32 do
+                        local rawVal = m_clamp((yamaFFT[i] or 0) * 12, 0, 1)
+                        yamaFFT_Smooth[i] = rawVal > yamaFFT_Smooth[i] and rawVal or math.max(0, yamaFFT_Smooth[i] - ft * 2)
+                        local val = yamaFFT_Smooth[i]
+                        
+                        if val > 0.05 then
+                            local bx = visX + (i - 1) * barW
+                            render.setRGBA(
+                                YAMA_CFG.Colors.VisBot.r + (YAMA_CFG.Colors.VisTop.r - YAMA_CFG.Colors.VisBot.r) * val,
+                                YAMA_CFG.Colors.VisBot.g + (YAMA_CFG.Colors.VisTop.g - YAMA_CFG.Colors.VisBot.g) * val,
+                                YAMA_CFG.Colors.VisBot.b + (YAMA_CFG.Colors.VisTop.b - YAMA_CFG.Colors.VisBot.b) * val, 
+                                255
+                            )
+                            render.drawRoundedBox(2, bx, visY + visH - (val * visH), barW - 2, val * visH)
+                        end
+                    end
+                elseif yamaUI.visMode == 2 then
+                    for i = 1, 32 do
+                        local rawVal = m_clamp((yamaFFT[i] or 0) * 12, 0, 1)
+                        yamaFFT_Smooth[i] = rawVal > yamaFFT_Smooth[i] and rawVal or math.max(0, yamaFFT_Smooth[i] - ft * 2)
+                        yamaUI.polyLine[i].x = visX + ((i - 1) * (visW / 32))
+                        yamaUI.polyLine[i].y = visY + visH - (yamaFFT_Smooth[i] * visH)
+                    end
+                    render.setColor(YAMA_CFG.Colors.VisTop)
+                    for i = 1, 31 do
+                        render.drawLine(yamaUI.polyLine[i].x, yamaUI.polyLine[i].y, yamaUI.polyLine[i + 1].x, yamaUI.polyLine[i + 1].y)
+                    end
+                end
+
+                render.setFont(fontTitle)
+                render.setColor(YAMA_CFG.Colors.TextPrimary)
+                render.drawSimpleText(dX + pw/2, dY + 335, yamaState.cachedTitle, 1, 1)
+                
+                render.setFont(fontSub)
+                render.setColor(YAMA_CFG.Colors.TextDim)
+                if yamaState.cachedPrev ~= "" then render.drawSimpleText(dX + 20, dY + 335, yamaState.cachedPrev, 0, 1) end
+                if yamaState.cachedNext ~= "" then render.drawSimpleText(dX + pw - 20, dY + 335, yamaState.cachedNext, 2, 1) end
+            end
+
+            local curTime, totalTime = 0, 0
+            if isValid(yamaSnd) then
+                totalTime = yamaSnd:getLength()
+                if not yamaUI.draggingSeek then
+                    curTime = yamaSnd:getTime()
+                    yamaUI.seekFrac = totalTime > 0 and (curTime / totalTime) or 0
+                else
+                    curTime = yamaUI.seekFrac * totalTime
+                end
+            end
+
+            -- SEEK_BAR_Y is centralised in YAMA_CFG.SEEK_BAR_Y (must match yamaUpdateRT)
+            local seekY = dY + YAMA_CFG.SEEK_BAR_Y
+            render.setColor(YAMA_CFG.Colors.Accent)
+            render.drawRoundedBox(4, dX + 10, seekY, (pw - 20) * yamaUI.seekFrac, 12)
+
+            render.setFont(fontSub)
+            render.setColor(YAMA_CFG.Colors.TextPrimary)
+            render.drawSimpleText(dX + pw - 20, dY + 395, totalTime > 0 and yamaFormatTime(curTime) or "LIVE", 2, 1)
+
+            render.popMatrix()
+        end)
+
+            hook.add("removed", "YamaCleanup", function()
+            -- Force a final flush of any unsaved data
+            if yamaDirtySettings then saveSettings() end
+            if yamaDirtyPlaylist then savePlaylist() end
+
+            if isValid(yamaSnd) then yamaSnd:stop() yamaSnd = nil end
+            if isValid(yamaSnd_Precanned) then yamaSnd_Precanned:stop() yamaSnd_Precanned = nil end
+            input.enableCursor(false)
+        end)
+    end
+end
